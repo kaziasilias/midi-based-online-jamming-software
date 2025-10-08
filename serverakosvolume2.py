@@ -36,24 +36,6 @@ async def broadcast_room_list():
         for peers in rooms.values():
             peers.discard(ws)
 
-async def broadcast_user_list(room):
-    """Send the updated user list to all clients in a specific room."""
-    if room not in rooms:
-        return
-    user_list = [usernames.get(peer, "Unknown") for peer in rooms[room]]
-    message = json.dumps({"type": "user_list", "users": user_list})
-
-    dead = []
-    for peer in list(rooms[room]):
-        try:
-            await peer.send_str(message)
-        except Exception:
-            dead.append(peer)
-
-    # Cleanup broken sockets
-    for peer in dead:
-        rooms[room].discard(peer)
-        usernames.pop(peer, None)
 
 
 async def websocket_handler(request):
@@ -81,7 +63,12 @@ async def websocket_handler(request):
                     rooms[room] = set()
                 rooms[room].add(ws)
                 # Broadcast full user list to the room
-                await broadcast_user_list(room)
+                user_list = [usernames.get(peer, "Unknown") for peer in rooms[room]]
+                for peer in rooms[room]:
+                    await peer.send_str(json.dumps({
+                        "type": "user_list",
+                        "users": user_list
+                    }))
 
                 print(f"👤 {username} joined room '{room}'")
                 await broadcast_room_list()
@@ -100,21 +87,16 @@ async def websocket_handler(request):
 
                 # Now broadcast updated user list
                 if room in rooms:
-                    await broadcast_user_list(room)
-
+                    user_list = [usernames.get(peer, "Unknown") for peer in rooms[room]]
+                    for peer in rooms[room]:
+                        await peer.send_str(json.dumps({
+                            "type": "user_list",
+                            "users": user_list
+                        }))
                 await broadcast_room_list()
                 continue
 
-            # Handle WebRTC signaling messages
-            if data["type"] in ["offer", "answer", "candidate"]:
-                print(f"📤 Relaying {data['type'].upper()} from {usernames.get(ws, 'Unknown')} in room {data['room']}")
-                target_room = data["room"]
-                for peer in rooms.get(target_room, []):
-                    if peer != ws:
-                        await peer.send_str(json.dumps(data))
-                continue
-
-            # Relay any other data (like MIDI JSON) to peers in the room
+            # Relay messages to everyone else in the same room
             if room and room in rooms:
                 for peer in list(rooms[room]):
                     if peer is not ws:
