@@ -6,8 +6,11 @@ from midiuser_ui import Ui_MainWindow
 from midisettings_ui import Ui_Form
 from roomform_ui import Ui_roomwindow
 from roomsettings_ui import Ui_roomSettingsWindow
+from routingmanager_ui import Ui_routingDialog
+from PyQt5.QtWidgets import QDialog, QComboBox, QSpinBox
 import mido
 import time
+from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QWidget
 from mido import Message
 import websockets
 from qasync import QEventLoop
@@ -27,14 +30,105 @@ ice_config = RTCConfiguration(iceServers=[
 ])
 
 
+class PianoWidget(QtWidgets.QWidget):
+    """
+    A two-octave piano: properly overlapped black keys above white keys.
+    - No labels on keys
+    - Only local key presses highlight (remote notes do NOT)
+    - Calls a provided send_midi(note, velocity) callback
+    """
+    WHITE_ORDER = [0, 2, 4, 5, 7, 9, 11]          # C D E F G A B
+    BLACK_MAP   = {0:1, 1:3, 3:6, 4:8, 5:10}      # which white-index has a black key after it (no sharps after E/B)
+
+    def __init__(self, parent=None, start_note=60, white_keys=21, on_send_midi=None):
+        super().__init__(parent)
+        self.start_note = start_note          # C4 by default
+        self.white_keys = white_keys          # 14 white keys = two octaves
+        self.on_send_midi = on_send_midi      # callback(room.send_midi)
+
+        # key geometry
+        self.WHITE_W, self.WHITE_H = 32, 150
+        self.BLACK_W, self.BLACK_H = 20, 95
+        self.setFixedSize(self.white_keys * self.WHITE_W, self.WHITE_H)
+
+        # containers
+        self.white_btns = {}   # note -> QPushButton
+        self.black_btns = {}   # note -> QPushButton
+
+        # No layout: absolute positioning to overlap blacks over whites
+        # ---- place white keys ----
+        for i in range(self.white_keys):
+            octave   = i // 7
+            w_index  = i % 7
+            midi     = self.start_note + self.WHITE_ORDER[w_index] + 12 * octave
+
+            btn = QtWidgets.QPushButton("", self)
+            btn.setGeometry(i * self.WHITE_W, 0, self.WHITE_W, self.WHITE_H)
+            btn.setFocusPolicy(QtCore.Qt.NoFocus)
+            btn.setStyleSheet("background:#fff; border:1px solid #000;")
+            btn.pressed.connect(lambda n=midi: self._local_press(n))
+            btn.released.connect(lambda n=midi: self._local_release(n))
+            self.white_btns[midi] = btn
+
+        # ---- place black keys (between whites, except after E/B) ----
+        for i in range(self.white_keys):
+            w_index = i % 7
+            if w_index in self.BLACK_MAP:
+                octave = i // 7
+                midi   = self.start_note + self.BLACK_MAP[w_index] + 12 * octave
+
+                # center black over gap between white i and i+1
+                x = i * self.WHITE_W + (self.WHITE_W - self.BLACK_W // 2)
+                btn = QtWidgets.QPushButton("", self)
+                btn.setGeometry(x, 0, self.BLACK_W, self.BLACK_H)
+                btn.raise_()
+                btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setStyleSheet("background:#000; border:1px solid #333;")
+                btn.pressed.connect(lambda n=midi: self._local_press(n))
+                btn.released.connect(lambda n=midi: self._local_release(n))
+                self.black_btns[midi] = btn
+
+    # ---- local press/release: send MIDI + highlight locally only ----
+    def _local_press(self, note):
+        if callable(self.on_send_midi):
+            self.on_send_midi(note, 100)
+        self._highlight(note, True)
+
+    def _local_release(self, note):
+        if callable(self.on_send_midi):
+            self.on_send_midi(note, 0)
+        self._highlight(note, False)
+
+    def _highlight(self, note, on):
+        # set color back based on key type
+        if note in self.white_btns:
+            btn = self.white_btns[note]
+            if on:
+                btn.setStyleSheet("background: #ffea75; border:2px solid #d9a400;")  # yellow
+            else:
+                btn.setStyleSheet("background:#fff; border:1px solid #000;")
+        elif note in self.black_btns:
+            btn = self.black_btns[note]
+            if on:
+                btn.setStyleSheet("background: #555; border:2px solid #333;")        # lighter when pressed
+            else:
+                btn.setStyleSheet("background:#000; border:1px solid #333;")
+
+
+
 class RoomWindow(QWidget):
     def __init__(self, main_app, room_name="lobby", is_creator=False):
         super().__init__()
+        self.local_mute = False
         self.main_app = main_app
         self.room_name = room_name
         self.is_creator = is_creator
         self.ui = Ui_roomwindow()
         self.ui.setupUi(self)
+        self.piano = PianoWidget(self)
+        layout = QtWidgets.QHBoxLayout(self.ui.PianoWidget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.piano)
         self.setWindowTitle(f"Jam Room - {room_name}")
         self.ui.LeaveButton.clicked.connect(self.leave_room)
         self.ui.logArea.clear()
@@ -43,15 +137,16 @@ class RoomWindow(QWidget):
         self.user_latency_labels = {}
         self.connected_users = []
         self.add_user_ui(self.main_app.username)  # show myself
-
+        self.ui.routingmanagerButton.clicked.connect(self.open_routing_manager)
         # WebRTC objects
         self.offer_sent = False
         self.pc = None
         self.channel = None
-
         # MIDI
         self.midi_input = None
         self.midi_output = None
+        self.ui.muteButton.clicked.connect(self.toggle_local_mute)
+
         try:
             if self.main_app.selected_input:
                 self.midi_input = mido.open_input(self.main_app.selected_input)
@@ -67,6 +162,10 @@ class RoomWindow(QWidget):
         self.ping_timer = QtCore.QTimer()
         self.ping_timer.timeout.connect(lambda: asyncio.ensure_future(self.send_ping()))
         self.ping_timer.start(3000)  # every 3 seconds
+
+    def open_routing_manager(self):
+        dlg = RoutingManager(self.main_app)
+        dlg.exec_()
 
     async def send_ping(self):
         """Periodically send ping messages to every other connected user."""
@@ -121,6 +220,12 @@ class RoomWindow(QWidget):
         self.channel.on("message", self.on_midi_message)
 
     def leave_room(self):
+        if self.pc:
+            asyncio.ensure_future(self.pc.close())
+        self.pc = None
+        self.channel = None
+        self.offer_sent = False
+
         if self.main_app.ws:
             asyncio.get_event_loop().create_task(
                 self.main_app.ws.send(json.dumps({
@@ -194,20 +299,37 @@ class RoomWindow(QWidget):
             print("🎹 Got MIDI message:", msg)
 
             if msg.type in ("note_on", "note_off"):
-                # update my bar locally
                 me = self.main_app.username
-                if me in self.user_ui_elements:
-                    self.user_velocity_bars[me].setValue(msg.velocity)
+                note = getattr(msg, "note", None)
+                velocity = getattr(msg, "velocity", None)
+
+                # --- Local visualization ---
+                if hasattr(self, "piano"):
+                    self.piano._highlight(note, velocity > 0)
+
+                if me in self.user_velocity_bars:
+                    self.user_velocity_bars[me].setValue(velocity)
                     QtCore.QTimer.singleShot(300, lambda: self.user_velocity_bars[me].setValue(0))
 
-                midi_event = {
-                    "user": me,
-                    "note": getattr(msg, "note", None),
-                    "velocity": getattr(msg, "velocity", None),
-                    "type": msg.type
-                }
+                # --- Local playback (respect mute) ---
+                if not getattr(self, "local_mute", False) and self.midi_output:
+                    from mido import Message
+                    try:
+                        self.midi_output.send(Message(msg.type, note=note, velocity=velocity))
+                    except Exception as e:
+                        print("⚠️ MIDI out error (local):", e)
+                else:
+                    if getattr(self, "local_mute", False):
+                        print("🔇 Local playback muted, skipping local output")
 
+                # --- Send to others over WebRTC ---
                 if self.channel and getattr(self.channel, "readyState", None) == "open":
+                    midi_event = {
+                        "user": me,
+                        "note": note,
+                        "velocity": velocity,
+                        "type": msg.type,
+                    }
                     self.channel.send(json.dumps(midi_event))
                     print("📤 Sent MIDI event:", midi_event)
                 else:
@@ -216,6 +338,8 @@ class RoomWindow(QWidget):
     def on_midi_message(self, message):
         try:
             data = json.loads(message)
+            if data.get("user") == self.main_app.username:
+                return
             # 🕒 Handle ping/pong control messages first
             if data.get("type") == "ping" and data.get("to") == self.main_app.username:
                 reply = {
@@ -257,6 +381,10 @@ class RoomWindow(QWidget):
                     print("MIDI out error:", e)
 
             self.ui.logArea.append(f"{user}: {msg_type} note={note} vel={velocity}")
+            if hasattr(self, "piano") and data["user"] != self.main_app.username:
+                if data["velocity"] > 0:
+                    self.piano._highlight(data["note"], True)
+                    QtCore.QTimer.singleShot(200, lambda n=data["note"]: self.piano._highlight(n, False))
         except Exception as e:
             print("Failed to parse MIDI message:", e)
 
@@ -288,6 +416,14 @@ class RoomWindow(QWidget):
                 # Also clean up velocity + latency bars
                 self.user_velocity_bars.pop(username, None)
                 self.user_latency_labels.pop(username, None)
+        # 🧠 If only the room creator remains, reset WebRTC to accept new joiners
+        if self.is_creator and len(users) <= 1:
+            print("🔄 All peers left — resetting WebRTC state for future connections.")
+            if self.pc:
+                asyncio.ensure_future(self.pc.close())
+            self.pc = None
+            self.channel = None
+            self.offer_sent = False
 
         print(f"👥 Updated user list: {users}")
 
@@ -320,27 +456,109 @@ class RoomWindow(QWidget):
         self.user_latency_labels[username] = latency_label
 
     async def start_offer(self):
+        # Prevent duplicate offers
         if self.offer_sent:
             return
-        # Creator creates DataChannel and sends offer
+
+        # Ensure PeerConnection exists
+        if not self.pc:
+            print("🔧 Creating new RTCPeerConnection before sending offer.")
+            self.pc = RTCPeerConnection()
+
+        # Create DataChannel safely
+        if not self.channel:
+            self.channel = self.pc.createDataChannel("midi")
+
+            @self.channel.on("open")
+            def on_open():
+                print(f"✅ DataChannel opened for {self.main_app.username}")
+
+            self.channel.on("message", self.on_midi_message)
+
+        # Create SDP offer
         print(f"🟢 {self.main_app.username} creating OFFER now (peer present)")
-        self.channel = self.pc.createDataChannel("midi")
-
-        @self.channel.on("open")
-        def on_open():
-            print(f"✅ DataChannel opened for {self.main_app.username}")
-
-        self.channel.on("message", self.on_midi_message)
-
         offer = await self.pc.createOffer()
         await self.pc.setLocalDescription(offer)
+
+        # Send offer to the signaling server
         await self.main_app.ws.send(json.dumps({
             "type": "offer",
             "room": self.room_name,
             "sdp": self.pc.localDescription.sdp,
             "sdpType": self.pc.localDescription.type
         }))
+
         self.offer_sent = True
+
+    def toggle_local_mute(self):
+        self.local_mute = not self.local_mute
+        state = "🔇 Muted" if self.local_mute else "🔊 Active"
+        self.ui.muteButton.setText(f"Mute Local ({state})")
+        print(f"[RoomWindow] Local mute set to {self.local_mute}")
+
+
+class RoutingManager(QDialog):
+    def __init__(self, main_app):
+        super().__init__()
+        self.main_app = main_app
+        self.ui = Ui_routingDialog()
+        self.ui.setupUi(self)
+        self.setWindowTitle("Routing Manager")
+
+        # Setup headers (optional if done in UI)
+        self.ui.routingTable.setHorizontalHeaderLabels(["User", "Output", "Channel"])
+
+        # Fill the table now
+        self.refresh_table()
+
+        # Connect buttons
+        self.ui.refreshButton.clicked.connect(self.refresh_table)
+        self.ui.saveButton.clicked.connect(self.save_and_close)
+
+    def refresh_table(self):
+        """Populate routing table with connected users and available outputs."""
+        if not self.main_app.room_window:
+            return
+
+        users = list(self.main_app.room_window.user_ui_elements.keys())
+        outputs = self.get_midi_outputs()
+
+        self.ui.routingTable.setRowCount(len(users))
+        for row, user in enumerate(users):
+            # User name (non-editable)
+            item = QtWidgets.QTableWidgetItem(user)
+            item.setFlags(QtCore.Qt.ItemIsEnabled)
+            self.ui.routingTable.setItem(row, 0, item)
+
+            # Output dropdown
+            combo = QComboBox()
+            combo.addItems(outputs)
+            self.ui.routingTable.setCellWidget(row, 1, combo)
+
+            # Channel spinbox
+            spin = QSpinBox()
+            spin.setRange(1, 16)
+            self.ui.routingTable.setCellWidget(row, 2, spin)
+
+    def get_midi_outputs(self):
+        """Detect available MIDI output ports."""
+        import mido
+        return mido.get_output_names()
+
+    def save_and_close(self):
+        """Save routing configuration."""
+        routing_config = {}
+        for row in range(self.ui.routingTable.rowCount()):
+            user = self.ui.routingTable.item(row, 0).text()
+            output_widget = self.ui.routingTable.cellWidget(row, 1)
+            channel_widget = self.ui.routingTable.cellWidget(row, 2)
+            output = output_widget.currentText()
+            channel = channel_widget.value()
+            routing_config[user] = {"output": output, "channel": channel}
+
+        self.main_app.routing_config = routing_config
+        print("🎛️ Routing Config Updated:", routing_config)
+        self.accept()
 
 
 class RoomSettingsWindow(QMainWindow):
@@ -396,6 +614,7 @@ class MidiUserApp(QMainWindow):
         self.ui.actionMIDIsettings.triggered.connect(self.open_settings_window)
         asyncio.get_event_loop().create_task(self.listen_for_rooms())
         self.ws = None
+        self.routing_config = {}
         self.room_window = None
 
     async def handle_offer(self, data):
