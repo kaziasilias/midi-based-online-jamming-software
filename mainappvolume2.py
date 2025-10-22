@@ -137,21 +137,32 @@ class RoomWindow(QWidget):
         self.user_latency_labels = {}
         self.connected_users = []
         self.add_user_ui(self.main_app.username)  # show myself
+        self.ui.muteButton.clicked.connect(self.toggle_local_mute)
         self.ui.routingmanagerButton.clicked.connect(self.open_routing_manager)
         # WebRTC objects
         self.offer_sent = False
         self.pc = None
         self.channel = None
-        # MIDI
+        # Use preselected ports from settings
         self.midi_input = None
         self.midi_output = None
-        self.ui.muteButton.clicked.connect(self.toggle_local_mute)
+
+        from mido import open_input, open_output
+
+        # Initialize MIDI I/O based on saved settings
+        self.midi_input = None
+        self.midi_output = None
+
+        selected_in = getattr(self.main_app, "selected_input", None)
+        selected_out = getattr(self.main_app, "selected_output", None)
 
         try:
-            if self.main_app.selected_input:
-                self.midi_input = mido.open_input(self.main_app.selected_input)
-            if self.main_app.selected_output:
-                self.midi_output = mido.open_output(self.main_app.selected_output)
+            if selected_in:
+                self.midi_input = open_input(selected_in)
+                print(f"🎹 Using selected MIDI input: {selected_in}")
+            if selected_out:
+                self.midi_output = open_output(selected_out)
+                print(f"🎧 Using selected MIDI output: {selected_out}")
         except Exception as e:
             QMessageBox.critical(self, "MIDI Error", f"Could not open MIDI port:\n{e}")
 
@@ -321,8 +332,11 @@ class RoomWindow(QWidget):
                 else:
                     if getattr(self, "local_mute", False):
                         print("🔇 Local playback muted, skipping local output")
-
                 # --- Send to others over WebRTC ---
+                # Skip network-originated messages (to prevent echo)
+                if getattr(msg, "_from_network", False):
+                    continue  # don't resend notes that came from network
+
                 if self.channel and getattr(self.channel, "readyState", None) == "open":
                     midi_event = {
                         "user": me,
@@ -335,12 +349,12 @@ class RoomWindow(QWidget):
                 else:
                     print("⏳ Channel not open, skipping send")
 
+
     def on_midi_message(self, message):
         try:
             data = json.loads(message)
-            if data.get("user") == self.main_app.username:
-                return
-            # 🕒 Handle ping/pong control messages first
+
+            # --- Handle ping/pong control ---
             if data.get("type") == "ping" and data.get("to") == self.main_app.username:
                 reply = {
                     "type": "pong",
@@ -352,41 +366,69 @@ class RoomWindow(QWidget):
                     self.channel.send(json.dumps(reply))
                 return
 
-            elif data.get("type") == "pong" and data.get("to") == self.main_app.username:
+            if data.get("type") == "pong" and data.get("to") == self.main_app.username:
                 self.handle_pong(data)
                 return
-            midi_event = json.loads(message)
-            user = midi_event.get("user", "Unknown")
-            note = midi_event.get("note")
-            velocity = midi_event.get("velocity")
-            msg_type = midi_event.get("type")
-            print("Received MIDI event:", midi_event)
+
+            # --- Skip my own loopback ---
+            if data.get("user") == self.main_app.username:
+                return
+
+            # Mark this message as coming from the network
+            data["_from_network"] = True
+
+            user = data.get("user", "Unknown")
+            note = data.get("note")
+            velocity = data.get("velocity")
+            msg_type = data.get("type")
+
+            print("🎵 Received MIDI event:", data)
             self.add_user_ui(user)
+
             # Update velocity bar
+            if user in self.user_velocity_bars and velocity is not None:
+                self.user_velocity_bars[user].setValue(velocity)
+                QtCore.QTimer.singleShot(300, lambda: self.user_velocity_bars[user].setValue(0))
+
+            # --- Local playback for remote notes ---
+            # --- Routed playback for remote notes ---
             if note is not None and velocity is not None:
-                if user in self.user_velocity_bars:
-                    self.user_velocity_bars[user].setValue(velocity)
-                    QtCore.QTimer.singleShot(
-                        300, lambda: self.user_velocity_bars[user].setValue(0)
-                    )
-
-            # ✅ Forward to local MIDI output
-            if self.midi_output and note is not None and velocity is not None:
-                from mido import Message
+                from mido import Message, open_output
                 try:
-                    self.midi_output.send(
-                        Message(msg_type, note=note, velocity=velocity)
-                    )
-                except Exception as e:
-                    print("MIDI out error:", e)
+                    msg = Message(msg_type, note=note, velocity=velocity)
+                    msg.dict().update({"_from_network": True})
 
+
+                    # Look up routing config
+                    routed_port = None
+                    if hasattr(self.main_app, "routing_config"):
+                        route = self.main_app.routing_config.get(user)
+                        if route:
+                            port_name = route.get("output")
+                            channel = route.get("channel", 1)
+                            msg.channel = channel - 1
+                            if port_name:
+                                routed_port = open_output(port_name)
+
+                    if routed_port:
+                        routed_port.send(msg)
+                        routed_port.close()
+                        print(f"🎧 Routed {user}'s note to {port_name} (ch {channel})")
+                    elif self.midi_output:
+                        self.midi_output.send(msg)
+                        print(f"🎧 Default output used for {user}")
+                except Exception as e:
+                    print("⚠️ MIDI out error:", e)
+
+            # --- GUI Piano highlight ---
             self.ui.logArea.append(f"{user}: {msg_type} note={note} vel={velocity}")
-            if hasattr(self, "piano") and data["user"] != self.main_app.username:
-                if data["velocity"] > 0:
-                    self.piano._highlight(data["note"], True)
-                    QtCore.QTimer.singleShot(200, lambda n=data["note"]: self.piano._highlight(n, False))
+            if hasattr(self, "piano"):
+                if velocity > 0:
+                    self.piano._highlight(note, True)
+                    QtCore.QTimer.singleShot(200, lambda n=note: self.piano._highlight(n, False))
+
         except Exception as e:
-            print("Failed to parse MIDI message:", e)
+            print("❌ Failed to parse MIDI message:", e)
 
     def send_midi(self, note, velocity):
         if self.channel and self.channel.readyState == "open":
@@ -505,15 +547,22 @@ class RoutingManager(QDialog):
         self.ui.setupUi(self)
         self.setWindowTitle("Routing Manager")
 
-        # Setup headers (optional if done in UI)
         self.ui.routingTable.setHorizontalHeaderLabels(["User", "Output", "Channel"])
-
-        # Fill the table now
-        self.refresh_table()
 
         # Connect buttons
         self.ui.refreshButton.clicked.connect(self.refresh_table)
         self.ui.saveButton.clicked.connect(self.save_and_close)
+
+        # Load current config
+        self.refresh_table()
+
+    def get_midi_outputs(self):
+        """Detect available MIDI output ports."""
+        try:
+            return mido.get_output_names()
+        except Exception as e:
+            print("⚠️ Could not get MIDI outputs:", e)
+            return []
 
     def refresh_table(self):
         """Populate routing table with connected users and available outputs."""
@@ -522,38 +571,51 @@ class RoutingManager(QDialog):
 
         users = list(self.main_app.room_window.user_ui_elements.keys())
         outputs = self.get_midi_outputs()
-
         self.ui.routingTable.setRowCount(len(users))
+
         for row, user in enumerate(users):
-            # User name (non-editable)
-            item = QtWidgets.QTableWidgetItem(user)
-            item.setFlags(QtCore.Qt.ItemIsEnabled)
-            self.ui.routingTable.setItem(row, 0, item)
+            # User column
+            user_item = QtWidgets.QTableWidgetItem(user)
+            user_item.setFlags(QtCore.Qt.ItemIsEnabled)
+            self.ui.routingTable.setItem(row, 0, user_item)
 
             # Output dropdown
-            combo = QComboBox()
-            combo.addItems(outputs)
-            self.ui.routingTable.setCellWidget(row, 1, combo)
+            output_combo = QComboBox()
+            output_combo.addItems(outputs)
 
-            # Channel spinbox
+            existing_output = ""
+            if user in self.main_app.routing_config:
+                existing_output = self.main_app.routing_config[user].get("output", "")
+            elif getattr(self.main_app, "selected_output", None):
+                existing_output = self.main_app.selected_output  # fallback
+
+            idx = output_combo.findText(existing_output)
+            if idx >= 0:
+                output_combo.setCurrentIndex(idx)
+
+            self.ui.routingTable.setCellWidget(row, 1, output_combo)
+
+            # Channel spin box
             spin = QSpinBox()
             spin.setRange(1, 16)
+            if user in self.main_app.routing_config:
+                existing_ch = self.main_app.routing_config[user].get("channel", 1)
+                spin.setValue(existing_ch)
             self.ui.routingTable.setCellWidget(row, 2, spin)
-
-    def get_midi_outputs(self):
-        """Detect available MIDI output ports."""
-        import mido
-        return mido.get_output_names()
 
     def save_and_close(self):
         """Save routing configuration."""
         routing_config = {}
         for row in range(self.ui.routingTable.rowCount()):
-            user = self.ui.routingTable.item(row, 0).text()
+            user_item = self.ui.routingTable.item(row, 0)
+            if not user_item:
+                continue
+            user = user_item.text()
+
             output_widget = self.ui.routingTable.cellWidget(row, 1)
             channel_widget = self.ui.routingTable.cellWidget(row, 2)
-            output = output_widget.currentText()
-            channel = channel_widget.value()
+            output = output_widget.currentText() if output_widget else ""
+            channel = channel_widget.value() if channel_widget else 1
             routing_config[user] = {"output": output, "channel": channel}
 
         self.main_app.routing_config = routing_config
@@ -761,10 +823,22 @@ class SettingsWindow(QMainWindow):
     def apply_settings(self):
         selected_input = self.ui.inputCombo.currentText()
         selected_output = self.ui.outputCombo.currentText()
+
         if self.main_app:
+            # Save globally on the main app for later use
             self.main_app.selected_input = selected_input
             self.main_app.selected_output = selected_output
-            QMessageBox.information(self, "MIDI", f"Applied:\nInput: {selected_input}\nOutput: {selected_output}")
+
+            # Also store under consistent names used by RoomWindow
+            self.main_app.midi_input_name = selected_input
+            self.main_app.midi_output_name = selected_output
+
+            QMessageBox.information(
+                self,
+                "MIDI Settings Applied",
+                f"Input: {selected_input}\nOutput: {selected_output}"
+            )
+
         self.close()
 
 
