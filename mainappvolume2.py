@@ -169,7 +169,7 @@ class RoomWindow(QWidget):
         # Poll MIDI input
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.poll_midi_input)
-        self.timer.start(10)
+        self.timer.start(2)
         self.ping_timer = QtCore.QTimer()
         self.ping_timer.timeout.connect(lambda: asyncio.ensure_future(self.send_ping()))
         self.ping_timer.start(3000)  # every 3 seconds
@@ -201,28 +201,34 @@ class RoomWindow(QWidget):
                 print("⚠️ Failed to send ping:", e)
 
     def handle_pong(self, data):
-        """Calculate RTT between this user and the sender, then update label."""
         sent_time = data.get("timestamp")
         sender = data.get("from")
-        if not sent_time or not sender:
-            return
 
         rtt = (time.time() - sent_time) * 1000  # ms
 
-        # 🎨 color-coding for musical thresholds
-        if rtt < 30:
-            color = "green"
-        elif rtt < 80:
-            color = "orange"
-        else:
-            color = "red"
+        # NEW: store RTT samples per peer
+        if not hasattr(self, "rtt_samples"):
+            self.rtt_samples = {}
 
+        if sender not in self.rtt_samples:
+            self.rtt_samples[sender] = []
+
+        self.rtt_samples[sender].append(rtt)
+
+        # Limit to last 100 samples (optional)
+        self.rtt_samples[sender] = self.rtt_samples[sender][-100:]
+
+        # Compute jitter
+        import statistics
+        if len(self.rtt_samples[sender]) > 2:
+            jitter = statistics.stdev(self.rtt_samples[sender])
+        else:
+            jitter = 0.0
+
+        # Update label
         if sender in self.user_latency_labels:
             label = self.user_latency_labels[sender]
-            label.setText(f"Latency: {rtt:.1f} ms")
-            label.setStyleSheet(f"color: {color}; font-size: 10px;")
-
-        print(f"📥 Pong from {sender}: {rtt:.1f} ms")
+            label.setText(f"Latency: {rtt:.1f} ms  |  Jitter: {jitter:.1f} ms")
 
         # Start WebRTC
 
