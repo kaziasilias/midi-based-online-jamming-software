@@ -13,11 +13,13 @@ import time
 from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QWidget
 from mido import Message
 import websockets
+import csv
+from datetime import datetime
 from qasync import QEventLoop
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
 
 # WebRTC signaling server
-SIGNALING_SERVER = "ws://localhost:8080/ws"  # change to your VPS
+SIGNALING_SERVER = "ws://155.207.200.166:8080/ws"  # change to your VPS
 
 # ICE servers: STUN first, TURN fallback
 ice_config = RTCConfiguration(iceServers=[
@@ -229,6 +231,18 @@ class RoomWindow(QWidget):
         if sender in self.user_latency_labels:
             label = self.user_latency_labels[sender]
             label.setText(f"Latency: {rtt:.1f} ms  |  Jitter: {jitter:.1f} ms")
+
+        # --- Logging for performance analysis ---
+        try:
+            timestamp = datetime.utcnow().isoformat()
+            me = getattr(self.main_app, "username", "unknown")
+            room = getattr(self, "room_name", "unknown")
+
+            with open("latency_log.csv", "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([timestamp, room, me, sender, f"{rtt:.3f}", f"{jitter:.3f}"])
+        except Exception as e:
+            print("⚠️ Failed to log latency:", e)
 
         # Start WebRTC
 
