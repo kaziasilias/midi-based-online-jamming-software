@@ -3,13 +3,14 @@ import sys, asyncio, json, time
 from PyQt5 import QtWidgets, QtCore
 from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QWidget
 from midiuser_ui import Ui_MainWindow
-from midisettings_ui import Ui_Form
+from midisettings_ui import Ui_Form as Ui_SettingsForm
 from roomform_ui import Ui_roomwindow
 from roomsettings_ui import Ui_roomSettingsWindow
 from routingmanager_ui import Ui_routingDialog
 from PyQt5.QtWidgets import QDialog, QComboBox, QSpinBox
 import mido
 import time
+import re
 from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QWidget
 from mido import Message
 import websockets
@@ -17,6 +18,7 @@ import csv
 from datetime import datetime
 from qasync import QEventLoop
 from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
+from username import Ui_Form as Ui_UsernameForm
 
 # WebRTC signaling server
 SIGNALING_SERVER = "ws://155.207.200.166:8080/ws"  # change to your VPS
@@ -31,7 +33,117 @@ ice_config = RTCConfiguration(iceServers=[
     )
 ])
 
+import subprocess, threading, queue
 
+class VirtualMidiBridge:
+    def __init__(self, exe_path: str):
+        self.p = subprocess.Popen(
+            [exe_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        self._q = queue.Queue()
+        self._t = threading.Thread(target=self._reader, daemon=True)
+        self._t.start()
+        self._lock = threading.Lock()
+
+        # MIDI outputs opened by Python toward the virtual ports
+        self.output_cache = {}
+
+    def _reader(self):
+        for line in self.p.stdout:
+            self._q.put(line.rstrip("\n"))
+
+    def _cmd(self, line: str) -> str:
+        with self._lock:
+            print("BRIDGE CMD ->", line)
+            self.p.stdin.write(line + "\n")
+            self.p.stdin.flush()
+            resp = self._q.get()
+            print("BRIDGE RESP <-", resp)
+            return resp
+
+    def create(self, name: str) -> bool:
+        resp = self._cmd(f"CREATE|{name}")
+        if not resp.startswith("OK"):
+            return False
+
+        # Give Windows a little time to expose the MIDI port
+        time.sleep(0.5)
+        return True
+
+    def close(self, name: str) -> bool:
+        # close Python-side mido output first
+        out = self.output_cache.pop(name, None)
+        if out:
+            try:
+                out.close()
+            except Exception:
+                pass
+
+        resp = self._cmd(f"CLOSE|{name}")
+        return resp.startswith("OK")
+
+    def send_hex(self, name: str, hex_bytes: str) -> bool:
+        """
+        The C helper no longer handles SEND.
+        Python sends MIDI to the visible virtual port using mido.
+        """
+        try:
+            if name not in self.output_cache:
+                self.output_cache[name] = mido.open_output(name)
+
+            data = [int(x, 16) for x in hex_bytes.split()]
+            msg = mido.Message.from_bytes(data)
+
+            self.output_cache[name].send(msg)
+            return True
+
+        except Exception as e:
+            print(f"❌ Failed to send MIDI to {name}: {e}")
+            return False
+
+    def shutdown(self):
+        for name in list(self.output_cache.keys()):
+            try:
+                self.output_cache[name].close()
+            except Exception:
+                pass
+        self.output_cache.clear()
+
+        try:
+            self._cmd("EXIT")
+        except Exception:
+            pass
+
+        try:
+            self.p.terminate()
+        except Exception:
+            pass
+class UsernameDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ui = Ui_UsernameForm()
+        self.ui.setupUi(self)
+
+        self.username = None
+
+        self.ui.continueButton.clicked.connect(self.on_continue)
+        self.ui.usernameLine.returnPressed.connect(self.on_continue)
+
+    def on_continue(self):
+        text = self.ui.usernameLine.text().strip()
+
+        if not text:
+            QtWidgets.QMessageBox.warning(self, "Error", "Please enter a username.")
+            return
+
+        self.username = text
+        self.accept()
 class PianoWidget(QtWidgets.QWidget):
     """
     A two-octave piano: properly overlapped black keys above white keys.
@@ -137,6 +249,8 @@ class RoomWindow(QWidget):
         self.user_ui_elements = {}
         self.user_velocity_bars = {}
         self.user_latency_labels = {}
+        self.velocity_reset_timers = {}  # username -> QTimer
+        self.piano_off_timers = {}  # note -> QTimer (optional, prevents singleShot spam)
         self.connected_users = []
         self.add_user_ui(self.main_app.username)  # show myself
         self.ui.muteButton.clicked.connect(self.toggle_local_mute)
@@ -146,27 +260,55 @@ class RoomWindow(QWidget):
         self.pc = None
         self.channel = None
         # Use preselected ports from settings
-        self.midi_input = None
+        # Use preselected ports from settings
+        self.midi_inputs = []  # list of (stream_id, mido_input_port)
         self.midi_output = None
+        self.output_ports_cache = {}
+        self.stream_devices = {}  # stream_id -> device name
 
         from mido import open_input, open_output
 
-        # Initialize MIDI I/O based on saved settings
-        self.midi_input = None
-        self.midi_output = None
+        # Get selected inputs (new) or fallback to old single input
+        selected_inputs = getattr(self.main_app, "selected_inputs", None)
+        if not selected_inputs:
+            one = getattr(self.main_app, "selected_input", None)
+            selected_inputs = [one] if one else []
 
-        selected_in = getattr(self.main_app, "selected_input", None)
         selected_out = getattr(self.main_app, "selected_output", None)
 
-        try:
-            if selected_in:
-                self.midi_input = open_input(selected_in)
-                print(f"🎹 Using selected MIDI input: {selected_in}")
-            if selected_out:
-                self.midi_output = open_output(selected_out)
-                print(f"🎧 Using selected MIDI output: {selected_out}")
-        except Exception as e:
-            QMessageBox.critical(self, "MIDI Error", f"Could not open MIDI port:\n{e}")
+        self.failed_inputs = set()
+
+        for idx, dev_name in enumerate(selected_inputs, start=1):
+            try:
+                stream_id = self.main_app.make_stream_id(dev_name, idx)
+                inport = open_input(dev_name)
+                self.midi_inputs.append((stream_id, inport))
+                self.stream_devices[stream_id] = dev_name
+                # ✅ Ensure local vmidi output port exists for THIS exact stream_id
+                try:
+                    self.main_app.ensure_vmidi_bridge()
+                    if getattr(self.main_app, "vmidi", None):
+                        if stream_id not in self.main_app.local_vmidi_ports:
+                            username = getattr(self.main_app, "username",
+                                               "") or "user"
+                            port_name = self.main_app.make_local_port_name_device(username, dev_name, stream_id, idx)
+                            ok = self.main_app.vmidi.create(port_name)
+                            if ok:
+                                self.main_app.local_vmidi_ports[stream_id] = port_name
+                                self.main_app.created_vmidi_ports.add(port_name)
+                                self.main_app.debug_dump_midi_ports(f"after ensure local in RoomWindow {port_name}")
+                                # optional: auto-enable it if nothing selected yet
+                                if isinstance(getattr(self.main_app, "selected_outputs", None), list) and len(
+                                        self.main_app.selected_outputs) == 0:
+                                    self.main_app.selected_outputs = [port_name]
+                                print(f"✅ Ensured local vmidi port for {stream_id}: {port_name}")
+                            else:
+                                print(f"❌ Failed to ensure local vmidi port for {stream_id}: {port_name}")
+                except Exception as e:
+                    print("⚠️ ensure local vmidi in RoomWindow failed:", e)
+            except Exception as e:
+                self.failed_inputs.add(dev_name.lower())
+                print(f"⚠️ Failed to open input {dev_name}: {e}")
 
         # Poll MIDI input
         self.timer = QtCore.QTimer()
@@ -175,10 +317,129 @@ class RoomWindow(QWidget):
         self.ping_timer = QtCore.QTimer()
         self.ping_timer.timeout.connect(lambda: asyncio.ensure_future(self.send_ping()))
         self.ping_timer.start(3000)  # every 3 seconds
+        self.hotplug_timer = QtCore.QTimer()
+        self.hotplug_timer.timeout.connect(self.scan_new_midi_inputs)
+        self.hotplug_timer.start(3000)  # every 3 seconds
+
+    def send_streams_announce(self):
+        if not self.channel or getattr(self.channel, "readyState", None) != "open":
+            return
+
+        streams = []
+
+        # Prefer actually opened streams for this room session
+        if getattr(self, "stream_devices", None):
+            for stream_id, dev_name in self.stream_devices.items():
+                streams.append({"stream": stream_id, "device": dev_name})
+        else:
+            selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+            for idx, dev_name in enumerate(selected_inputs, start=1):
+                stream_id = self.main_app.make_stream_id(dev_name, idx)
+                streams.append({"stream": stream_id, "device": dev_name})
+
+        payload = {
+            "type": "streams_announce",
+            "room": self.room_name,
+            "user": self.main_app.username,
+            "streams": streams
+        }
+
+        try:
+            self.channel.send(json.dumps(payload))
+            print("📣 Sent streams_announce:", payload)
+        except Exception as e:
+            print("⚠️ Failed to send streams_announce:", e)
+
+    def bump_velocity_bar(self, username: str, velocity: int):
+        bar = self.user_velocity_bars.get(username)
+        if not bar:
+            return
+
+        bar.setValue(int(velocity))
+
+        t = self.velocity_reset_timers.get(username)
+        if t is None:
+            t = QtCore.QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(
+                lambda u=username: self.user_velocity_bars.get(u) and self.user_velocity_bars[u].setValue(0))
+            self.velocity_reset_timers[username] = t
+
+        # restart the same timer instead of creating new ones
+        t.start(300)
+
+    def preferred_remote_port(self, user: str, stream: str) -> str | None:
+        meta = getattr(self.main_app, "stream_meta", {}).get((user, stream), {})
+        room = meta.get("room", self.room_name)
+        device = meta.get("device", "UnknownDevice")
+
+        pool = getattr(self.main_app, "remote_port_pool", [])
+        if not pool:
+            return None
+
+        key_str = f"{room}|{user}|{device}|{stream}"
+        idx = abs(hash(key_str)) % len(pool)
+        return pool[idx]
 
     def open_routing_manager(self):
         dlg = RoutingManager(self.main_app)
+        self.main_app.routing_manager_dialog = dlg
         dlg.exec_()
+        self.main_app.routing_manager_dialog = None
+
+    def scan_new_midi_inputs(self):
+        import mido
+        from mido import open_input
+
+        def should_ignore_input(name: str) -> bool:
+            n = (name or "").lower()
+            if n in getattr(self.main_app, "created_vmidi_ports", set()):
+                return True
+
+            # Optional: ignore common virtual/loopback stuff that can create feedback
+            # (uncomment if you want)
+            # if "loopmidi" in n:
+            #     return True
+
+            return False
+
+        current_names = [n for n in mido.get_input_names() if not should_ignore_input(n)]
+        selected_inputs = set(getattr(self.main_app, "selected_inputs", []) or [])
+        if not selected_inputs:
+            return  # ✅ don't auto-open devices unless user selected them in settings
+
+        if selected_inputs:
+            current_names = [n for n in current_names if n in selected_inputs]
+
+        opened_names = set(n.lower() for n in self.stream_devices.values() if n)
+
+        new_devices = [d for d in current_names if d.lower() not in opened_names]
+        failed = getattr(self, "failed_inputs", set())
+        new_devices = [d for d in new_devices if d.lower() not in failed]
+
+        if not new_devices:
+            return
+
+        for dev_name in new_devices:
+            try:
+                def make_stream_id(dev_name: str, idx: int) -> str:
+                    base = "".join(c if c.isalnum() else "_" for c in (dev_name or "device")).strip("_")
+                    base = "_".join(base.split("_"))
+                    base = base[:24] if base else f"dev{idx}"
+                    return f"{base}_{idx}"
+
+                stream_id = make_stream_id(dev_name, len(self.midi_inputs) + 1)
+
+                inport = open_input(dev_name)
+                self.midi_inputs.append((stream_id, inport))
+                self.stream_devices[stream_id] = dev_name
+                print(f"➕ Hotplug: opened {stream_id} = {dev_name}")
+
+                # announce updated stream list to peers
+                self.send_streams_announce()
+
+            except Exception as e:
+                print(f"⚠️ Hotplug: failed to open {dev_name}: {e}")
 
     async def send_ping(self):
         """Periodically send ping messages to every other connected user."""
@@ -248,7 +509,22 @@ class RoomWindow(QWidget):
 
     def on_datachannel(self, channel):
         self.channel = channel
-        self.channel.on("message", self.on_midi_message)
+        print(f"📥 DataChannel received by {self.main_app.username}")
+
+        @channel.on("open")
+        def on_open():
+            print("✅ DataChannel opened (receiver)")
+            self.send_streams_announce()
+
+        channel.on("message", self.on_midi_message)
+
+        # ✅ IMPORTANT: sometimes channel is already open before handlers attach
+        if getattr(channel, "readyState", None) == "open":
+            print("✅ DataChannel already open (receiver) — announcing streams now")
+            self.send_streams_announce()
+        else:
+            # also send once after a tiny delay as a safety net
+            QtCore.QTimer.singleShot(200, self.send_streams_announce)
 
     def leave_room(self):
         if self.pc:
@@ -270,7 +546,68 @@ class RoomWindow(QWidget):
             self.channel.close()
         if self.pc:
             asyncio.ensure_future(self.pc.close())
+        # Stop timers first
+        try:
+            self.timer.stop()
+            self.ping_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.hotplug_timer.stop()
+        except Exception:
+            pass
 
+        # Close cached output ports
+        for name, port in list(self.output_ports_cache.items()):
+            try:
+                port.close()
+            except Exception:
+                pass
+        self.output_ports_cache.clear()
+        # Close ALL remote vmidi ports created for this room session
+        # Close ALL remote vmidi ports created for this room session
+        try:
+            if getattr(self.main_app, "vmidi", None):
+                for (u, s), route in list(self.main_app.routing_config.items()):
+                    # 🔒 Do NOT close my local port
+                    if u == self.main_app.username:
+                        continue
+
+                    vm = route.get("vmidi")
+                    if vm:
+                        try:
+                            self.main_app.vmidi.close(vm)
+                            self.main_app.created_vmidi_ports.discard(vm)
+                        except Exception:
+                            pass
+                print("🧹 Closed all room vmidi ports")
+        except Exception:
+            pass
+
+        # Close main midi input/output if open
+        # Close all MIDI inputs
+        try:
+            for _, inport in self.midi_inputs:
+                try:
+                    inport.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.midi_inputs = []
+        try:
+            if self.midi_output:
+                self.midi_output.close()
+        except Exception:
+            pass
+        try:
+            self.main_app.routing_config.clear()
+            self.main_app.locked_routes.clear()
+            self.main_app.seen_streams.clear()
+            self.main_app.stream_meta.clear()
+            self.main_app.stream_pretty.clear()
+        except Exception:
+            pass
         self.main_app.show()
         self.close()
 
@@ -302,18 +639,10 @@ class RoomWindow(QWidget):
                         "sdpMLineIndex": event.candidate.sdpMLineIndex,
                     }
                 }))
-
         # 4) If the OTHER side creates the DataChannel (joiner path)
         @self.pc.on("datachannel")
         def on_datachannel(channel):
-            print(f"📥 DataChannel received by {self.main_app.username}")
-            self.channel = channel
-
-            @channel.on("open")
-            def on_open():
-                print(f"✅ DataChannel opened for {self.main_app.username}")
-
-            self.channel.on("message", self.on_midi_message)
+            self.on_datachannel(channel)
 
         # 5) Do NOT send an offer here. The creator will send it later,
         #    when a second user is present (user_list handler will trigger it).
@@ -323,56 +652,161 @@ class RoomWindow(QWidget):
             print(f"🟡 {self.main_app.username} (joiner) waiting for OFFER")
 
     def poll_midi_input(self):
-        if not self.midi_input:
+        if not self.midi_inputs:
+            return
+        for stream_id, inport in self.midi_inputs:
+            for msg in inport.iter_pending():
+                print(f"🎹 Got MIDI message from {stream_id}:", msg)
+
+                if msg.type in ("note_on", "note_off"):
+                    me = self.main_app.username
+                    note = getattr(msg, "note", None)
+                    velocity = getattr(msg, "velocity", None)
+
+                    # --- Local visualization ---
+                    if hasattr(self, "piano"):
+                        self.piano._highlight(note, velocity > 0)
+
+                    self.bump_velocity_bar(me, velocity)
+
+                    # --- Local playback (respect mute) ---
+                    if not getattr(self, "local_mute", False) and getattr(self.main_app, "vmidi", None):
+                        try:
+                            print("DEBUG stream_id:", stream_id)
+                            print("DEBUG local_vmidi_ports keys:",
+                                  list(getattr(self.main_app, "local_vmidi_ports", {}).keys()))
+                            print("DEBUG selected_outputs:", getattr(self.main_app, "selected_outputs", None))
+                            # --- Local playback (respect mute) ---
+                            # --- Local playback (respect mute) ---
+                            if not getattr(self, "local_mute", False) and getattr(self.main_app, "vmidi", None):
+                                try:
+                                    local_port = getattr(self.main_app, "local_vmidi_ports", {}).get(stream_id)
+
+                                    enabled_list = getattr(self.main_app, "selected_outputs", []) or []
+                                    enabled = None if any("main" in x for x in enabled_list) or len(
+                                        enabled_list) == 0 else set(enabled_list)
+
+                                    if local_port and (enabled is None or local_port in enabled):
+                                        b = msg.bytes()
+                                        hex_bytes = " ".join(f"{x:02X}" for x in b)
+                                        self.main_app.vmidi.send_hex(local_port, hex_bytes)
+                                    else:
+                                        print(f"⚠️ Local output disabled or missing for stream {stream_id} "
+                                              f"(local_port={local_port}, enabled={enabled_list})")
+
+                                except Exception as e:
+                                    print("⚠️ vmidi local send error:", e)
+                            else:
+                                if getattr(self, "local_mute", False):
+                                    print("🔇 Local playback muted, skipping local output")
+                        except Exception as e:
+                            print("⚠️ vmidi local send error:", e)
+                    else:
+                        if getattr(self, "local_mute", False):
+                            print("🔇 Local playback muted, skipping local output")
+
+                    # --- Send to others over WebRTC ---
+                    # Skip network-originated messages (to prevent echo)
+                    if getattr(msg, "_from_network", False):
+                        continue  # don't resend notes that came from network
+
+                    if self.channel and getattr(self.channel, "readyState", None) == "open":
+                        midi_event = {
+                            "user": me,
+                            "stream": stream_id,
+                            "note": note,
+                            "velocity": velocity,
+                            "type": msg.type,
+                        }
+                        self.channel.send(json.dumps(midi_event))
+                        print("📤 Sent MIDI event:", midi_event)
+                    else:
+                        print("⏳ Channel not open, skipping send")
+
+    def assign_leader(self, target_user: str):
+        # only current leader can assign
+        if getattr(self.main_app, "room_leader", None) != self.main_app.username:
+            return
+        if not self.main_app.ws:
             return
 
-        for msg in self.midi_input.iter_pending():
-            print("🎹 Got MIDI message:", msg)
+        asyncio.get_event_loop().create_task(
+            self.main_app.ws.send(json.dumps({
+                "type": "assign_leader",
+                "room": self.room_name,
+                "target": target_user
+            }))
+        )
 
-            if msg.type in ("note_on", "note_off"):
-                me = self.main_app.username
-                note = getattr(msg, "note", None)
-                velocity = getattr(msg, "velocity", None)
+    def update_leader_ui(self, leader: str | None):
+        # store on main_app so add_user_ui() can read it
+        self.main_app.room_leader = leader
 
-                # --- Local visualization ---
-                if hasattr(self, "piano"):
-                    self.piano._highlight(note, velocity > 0)
+        is_leader = (leader == self.main_app.username)
 
-                if me in self.user_velocity_bars:
-                    self.user_velocity_bars[me].setValue(velocity)
-                    QtCore.QTimer.singleShot(300, lambda: self.user_velocity_bars[me].setValue(0))
-
-                # --- Local playback (respect mute) ---
-                if not getattr(self, "local_mute", False) and self.midi_output:
-                    from mido import Message
-                    try:
-                        self.midi_output.send(Message(msg.type, note=note, velocity=velocity))
-                    except Exception as e:
-                        print("⚠️ MIDI out error (local):", e)
-                else:
-                    if getattr(self, "local_mute", False):
-                        print("🔇 Local playback muted, skipping local output")
-                # --- Send to others over WebRTC ---
-                # Skip network-originated messages (to prevent echo)
-                if getattr(msg, "_from_network", False):
-                    continue  # don't resend notes that came from network
-
-                if self.channel and getattr(self.channel, "readyState", None) == "open":
-                    midi_event = {
-                        "user": me,
-                        "note": note,
-                        "velocity": velocity,
-                        "type": msg.type,
-                    }
-                    self.channel.send(json.dumps(midi_event))
-                    print("📤 Sent MIDI event:", midi_event)
-                else:
-                    print("⏳ Channel not open, skipping send")
-
+        for user, container in self.user_ui_elements.items():
+            # find the Assign Leader button inside this user's widget
+            btns = container.findChildren(QtWidgets.QPushButton)
+            for b in btns:
+                if b.text() in ("Assign Leader", "Kick"):
+                    b.setVisible(is_leader and user != self.main_app.username)
 
     def on_midi_message(self, message):
+        port_name = None
         try:
             data = json.loads(message)
+
+            # --- Handle streams announcement (auto-routing) ---
+            if data.get("type") == "streams_announce":
+                sender = data.get("user")
+                room = data.get("room", self.room_name)
+                streams = data.get("streams", [])
+
+                if not sender or sender == self.main_app.username:
+                    return
+
+                for s in streams:
+                    stream = s.get("stream", "kbd1")
+                    device = s.get("device", "Unknown Device")
+                    key = (sender, stream)
+                    if hasattr(self.main_app, "seen_streams"):
+                        self.main_app.seen_streams.add(key)
+                    # Store metadata for routing manager (optional but recommended)
+                    if hasattr(self.main_app, "stream_meta"):
+                        self.main_app.stream_meta[key] = {
+                            "device": device,
+                            "room": room
+                        }
+                    # Human label for routing manager (can be long)
+                    self.main_app.stream_pretty[key] = f"{sender} — {device} ({stream})"
+
+                    # Actual Windows/FL port name (must be short)
+                    port_name = self.main_app.make_remote_port_name(sender, device, stream)
+                    self.main_app.stream_portname[key] = port_name
+
+                    existing = self.main_app.routing_config.get(key, {})
+
+                    if not existing.get("vmidi"):
+                        if getattr(self.main_app, "vmidi", None) is None:
+                            print("❌ vmidi bridge not running; cannot create ports.")
+                            continue
+                        self.main_app.ensure_vmidi_bridge()
+                        ok = self.main_app.vmidi.create(port_name)
+                        if ok:
+                            self.main_app.routing_config[key] = {"vmidi": port_name, "channel": 1}
+                            self.main_app.locked_routes.add(key)
+                            self.main_app.created_vmidi_ports.add(port_name)
+                            self.main_app.debug_dump_midi_ports(f"after create remote {port_name}")
+
+                            if getattr(self.main_app, "routing_manager_dialog", None):
+                                self.main_app.routing_manager_dialog.refresh_table()
+
+                            print(f"🔒 Auto-created vmidi port for {key}: {port_name}")
+                        else:
+                            print(f"❌ Failed to create vmidi port: {port_name}")
+                if getattr(self.main_app, "routing_manager_dialog", None):
+                    self.main_app.routing_manager_dialog.refresh_table()
+                return
 
             # --- Handle ping/pong control ---
             if data.get("type") == "ping" and data.get("to") == self.main_app.username:
@@ -396,19 +830,20 @@ class RoomWindow(QWidget):
 
             # Mark this message as coming from the network
             data["_from_network"] = True
-
             user = data.get("user", "Unknown")
+            stream = data.get("stream", "kbd1")  # default for older senders
             note = data.get("note")
             velocity = data.get("velocity")
             msg_type = data.get("type")
+            if hasattr(self.main_app, "seen_streams"):
+                self.main_app.seen_streams.add((user, stream))
 
             print("🎵 Received MIDI event:", data)
             self.add_user_ui(user)
 
             # Update velocity bar
-            if user in self.user_velocity_bars and velocity is not None:
-                self.user_velocity_bars[user].setValue(velocity)
-                QtCore.QTimer.singleShot(300, lambda: self.user_velocity_bars[user].setValue(0))
+            if velocity is not None:
+                self.bump_velocity_bar(user, velocity)
 
             # --- Local playback for remote notes ---
             # --- Routed playback for remote notes ---
@@ -416,32 +851,50 @@ class RoomWindow(QWidget):
                 from mido import Message, open_output
                 try:
                     msg = Message(msg_type, note=note, velocity=velocity)
-                    msg.dict().update({"_from_network": True})
+
 
 
                     # Look up routing config
-                    routed_port = None
-                    if hasattr(self.main_app, "routing_config"):
-                        route = self.main_app.routing_config.get(user)
-                        if route:
-                            port_name = route.get("output")
-                            channel = route.get("channel", 1)
-                            msg.channel = channel - 1
-                            if port_name:
-                                routed_port = open_output(port_name)
+                    route = self.main_app.routing_config.get((user, stream))
+                    vmidi_name = None
+                    channel = 1
 
-                    if routed_port:
-                        routed_port.send(msg)
-                        routed_port.close()
-                        print(f"🎧 Routed {user}'s note to {port_name} (ch {channel})")
-                    elif self.midi_output:
-                        self.midi_output.send(msg)
-                        print(f"🎧 Default output used for {user}")
+                    if route:
+                        vmidi_name = route.get("vmidi")
+                        channel = route.get("channel", 1)
+
+                    # Apply channel if needed
+                    msg.channel = (int(channel) - 1) if channel else 0
+
+                    if vmidi_name and getattr(self.main_app, "vmidi", None):
+                        try:
+                            b = msg.bytes()
+                            hex_bytes = " ".join(f"{x:02X}" for x in b)
+                            self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                            print(f"🎧 Routed {user}/{stream} → {vmidi_name} (ch {channel})")
+                        except Exception as e:
+                            print("⚠️ vmidi send error:", e)
+                    else:
+                        # fallback: old behavior (optional)
+                        if self.midi_output:
+                            try:
+                                self.midi_output.send(msg)
+                                print(f"🎧 Fallback default output used for {user}")
+                            except Exception as e:
+                                print("⚠️ MIDI out error:", e)
+
                 except Exception as e:
                     print("⚠️ MIDI out error:", e)
+                    # If a cached port became invalid, drop it so we can reopen later
+                    if port_name and port_name in self.output_ports_cache:
+                        try:
+                            self.output_ports_cache[port_name].close()
+                        except Exception:
+                            pass
+                        self.output_ports_cache.pop(port_name, None)
 
             # --- GUI Piano highlight ---
-            self.ui.logArea.append(f"{user}: {msg_type} note={note} vel={velocity}")
+            self.ui.logArea.append(f"{user}/{stream}: {msg_type} note={note} vel={velocity}")
             if hasattr(self, "piano"):
                 if velocity > 0:
                     self.piano._highlight(note, True)
@@ -454,14 +907,18 @@ class RoomWindow(QWidget):
         if self.channel and self.channel.readyState == "open":
             midi_event = {
                 "user": self.main_app.username,
+                "stream": "gui",
                 "note": note,
-                "velocity": velocity
+                "velocity": velocity,
+                "type": "note_on" if velocity > 0 else "note_off",
             }
             self.channel.send(json.dumps(midi_event))
 
     def update_user_list(self, users):
         """Synchronize UI with the current list of connected users."""
         self.connected_users = users
+        if self.channel and getattr(self.channel, "readyState", None) == "open":
+            self.send_streams_announce()
 
         # 1️⃣ Add any new users not yet in the UI
         for username in users:
@@ -478,6 +935,33 @@ class RoomWindow(QWidget):
                 # Also clean up velocity + latency bars
                 self.user_velocity_bars.pop(username, None)
                 self.user_latency_labels.pop(username, None)
+        # Close any vmidi ports that belonged to this user
+                to_close = []
+                for (u, s), route in list(self.main_app.routing_config.items()):
+                    if u == username:
+                        vm = route.get("vmidi")
+                        if vm:
+                            to_close.append(vm)
+                        # remove route + discovered stream
+                        self.main_app.routing_config.pop((u, s), None)
+                        self.main_app.seen_streams.discard((u, s))
+                        self.main_app.locked_routes.discard((u, s))
+                        self.main_app.stream_pretty.pop((u, s), None)
+                        self.main_app.stream_meta.pop((u, s), None)
+                        self.main_app.stream_portname.pop((u, s), None)
+
+                for vm in to_close:
+                    try:
+                        if self.main_app.vmidi:
+                            self.main_app.vmidi.close(vm)
+                        self.main_app.created_vmidi_ports.discard(vm)
+                        print(f"🧹 Closed vmidi port (user left): {vm}")
+                    except Exception as e:
+                        print("⚠️ Failed to close vmidi port:", vm, e)
+
+                if getattr(self.main_app, "routing_manager_dialog", None):
+                    self.main_app.routing_manager_dialog.refresh_table()
+
         # 🧠 If only the room creator remains, reset WebRTC to accept new joiners
         if self.is_creator and len(users) <= 1:
             print("🔄 All peers left — resetting WebRTC state for future connections.")
@@ -489,33 +973,81 @@ class RoomWindow(QWidget):
 
         print(f"👥 Updated user list: {users}")
 
+    def kick_user(self, target_user: str):
+        # only leader can kick
+        if getattr(self.main_app, "room_leader", None) != self.main_app.username:
+            return
+        if not self.main_app.ws:
+            return
+
+        # confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Kick user",
+            f"Kick {target_user} from the room?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        asyncio.get_event_loop().create_task(
+            self.main_app.ws.send(json.dumps({
+                "type": "kick",
+                "room": self.room_name,
+                "target": target_user
+            }))
+        )
+
     def add_user_ui(self, username):
         if username in self.user_ui_elements:
             return
 
-        # Create a container for the whole user section
         container = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(container)
+        outer = QtWidgets.QVBoxLayout(container)
+
+        # --- Row 1: name + buttons (horizontal) ---
+        top_row = QtWidgets.QHBoxLayout()
 
         name_label = QtWidgets.QLabel(username)
+        top_row.addWidget(name_label)
+
+        top_row.addStretch(1)
+
+        # Assign leader button (only shown to current leader, and not for self)
+        assign_btn = QtWidgets.QPushButton("Assign Leader")
+        assign_btn.setFixedHeight(22)
+        assign_btn.setVisible(False)  # will be controlled by update_leader_ui()
+        assign_btn.clicked.connect(lambda _, u=username: self.assign_leader(u))
+        top_row.addWidget(assign_btn)
+        kick_btn = QtWidgets.QPushButton("Kick")
+        kick_btn.setFixedHeight(22)
+        kick_btn.setVisible(False)  # controlled by update_leader_ui()
+        kick_btn.clicked.connect(lambda _, u=username: self.kick_user(u))
+        top_row.addWidget(kick_btn)
+
+        outer.addLayout(top_row)
+
+        # --- Row 2: velocity bar ---
         bar = QtWidgets.QProgressBar()
         bar.setValue(0)
+        outer.addWidget(bar)
 
+        # --- Row 3: latency label ---
         latency_label = QtWidgets.QLabel("Latency: -- ms")
         latency_label.setStyleSheet("color: gray; font-size: 10px;")
         if username == self.main_app.username:
             latency_label.hide()
-
-        layout.addWidget(name_label)
-        layout.addWidget(bar)
-        layout.addWidget(latency_label)
+        outer.addWidget(latency_label)
 
         self.ui.uservelocityLayout.addWidget(container)
 
-        # Now store the whole container, not just the bar
+        # Store
         self.user_ui_elements[username] = container
         self.user_velocity_bars[username] = bar
         self.user_latency_labels[username] = latency_label
+
+        # Apply visibility rule now (in case leader already known)
+        self.update_leader_ui(getattr(self.main_app, "room_leader", None))
 
     async def start_offer(self):
         # Prevent duplicate offers
@@ -534,7 +1066,7 @@ class RoomWindow(QWidget):
             @self.channel.on("open")
             def on_open():
                 print(f"✅ DataChannel opened for {self.main_app.username}")
-
+                self.send_streams_announce()
             self.channel.on("message", self.on_midi_message)
 
         # Create SDP offer
@@ -566,12 +1098,11 @@ class RoutingManager(QDialog):
         self.ui = Ui_routingDialog()
         self.ui.setupUi(self)
         self.setWindowTitle("Routing Manager")
-
-        self.ui.routingTable.setHorizontalHeaderLabels(["User", "Output", "Channel"])
-
+        self.ui.routingTable.setHorizontalHeaderLabels(["User", "Stream", "Output", "Channel"])
         # Connect buttons
         self.ui.refreshButton.clicked.connect(self.refresh_table)
-        self.ui.saveButton.clicked.connect(self.save_and_close)
+        #self.ui.saveButton.clicked.connect(self.save_and_close)
+        self.ui.cancelButton.clicked.connect(self.close)
 
         # Load current config
         self.refresh_table()
@@ -585,62 +1116,99 @@ class RoutingManager(QDialog):
             return []
 
     def refresh_table(self):
-        """Populate routing table with connected users and available outputs."""
-        if not self.main_app.room_window:
-            return
+        # Collect discovered (user, stream) pairs
+        # Collect discovered / announced / routed (user, stream) pairs
+        me = self.main_app.username
 
-        users = list(self.main_app.room_window.user_ui_elements.keys())
-        outputs = self.get_midi_outputs()
-        self.ui.routingTable.setRowCount(len(users))
+        seen = set(getattr(self.main_app, "seen_streams", set()))
+        announced = set(getattr(self.main_app, "stream_pretty", {}).keys())
+        routed = set(getattr(self.main_app, "routing_config", {}).keys())
 
-        for row, user in enumerate(users):
-            # User column
-            user_item = QtWidgets.QTableWidgetItem(user)
-            user_item.setFlags(QtCore.Qt.ItemIsEnabled)
-            self.ui.routingTable.setItem(row, 0, user_item)
+        streams = sorted(seen | announced | routed)
+        streams = [(u, s) for (u, s) in streams if u != me]
+        table = self.ui.routingTable
+        table.setRowCount(len(streams))
 
-            # Output dropdown
-            output_combo = QComboBox()
-            output_combo.addItems(outputs)
+        locked = getattr(self.main_app, "locked_routes", set())
+        routing = getattr(self.main_app, "routing_config", {})
+        pretty_map = getattr(self.main_app, "stream_pretty", {})
 
-            existing_output = ""
-            if user in self.main_app.routing_config:
-                existing_output = self.main_app.routing_config[user].get("output", "")
-            elif getattr(self.main_app, "selected_output", None):
-                existing_output = self.main_app.selected_output  # fallback
+        for row, (user, stream) in enumerate(streams):
+            key = (user, stream)
 
-            idx = output_combo.findText(existing_output)
-            if idx >= 0:
-                output_combo.setCurrentIndex(idx)
+            # ---- Column 0: User (read-only) ----
+            item_user = QtWidgets.QTableWidgetItem(user)
+            item_user.setFlags(item_user.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, item_user)
 
-            self.ui.routingTable.setCellWidget(row, 1, output_combo)
+            # ---- Column 1: Stream / Pretty name (read-only) ----
+            pretty = pretty_map.get(key)
+            display = pretty if pretty else stream
+            item_stream = QtWidgets.QTableWidgetItem(display)
+            item_stream.setFlags(item_stream.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_stream.setData(QtCore.Qt.UserRole, stream)
 
-            # Channel spin box
-            spin = QSpinBox()
-            spin.setRange(1, 16)
-            if user in self.main_app.routing_config:
-                existing_ch = self.main_app.routing_config[user].get("channel", 1)
-                spin.setValue(existing_ch)
-            self.ui.routingTable.setCellWidget(row, 2, spin)
+            # Tooltip shows the pretty name + lock status
+            tooltip_lines = []
+            if pretty:
+                tooltip_lines.append(pretty)
+            if key in locked:
+                tooltip_lines.append("🔒 Auto-allocated")
+            if tooltip_lines:
+                item_stream.setToolTip("\n".join(tooltip_lines))
+
+            table.setItem(row, 1, item_stream)
+
+            # ---- Column 2: Output (fixed text, read-only) ----
+            route = routing.get(key, {})
+            assigned = route.get("vmidi", "")
+            out_text = assigned if assigned else "(allocating...)"
+            # Show the mapping in the cell so user understands what it is
+            label = pretty if pretty else f"{user}.{stream}"
+            item_out = QtWidgets.QTableWidgetItem(f"{out_text}   ←   {label}")
+            item_out.setFlags(item_out.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 2, item_out)
+
+            # ---- Column 3: Channel (fixed text, read-only) ----
+            ch = int(route.get("channel", 1) or 1)
+            item_ch = QtWidgets.QTableWidgetItem(str(ch))
+            item_ch.setFlags(item_ch.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 3, item_ch)
 
     def save_and_close(self):
-        """Save routing configuration."""
-        routing_config = {}
-        for row in range(self.ui.routingTable.rowCount()):
-            user_item = self.ui.routingTable.item(row, 0)
-            if not user_item:
+        table = self.ui.routingTable
+        locked = getattr(self.main_app, "locked_routes", set())
+        old_config = getattr(self.main_app, "routing_config", {})
+
+        # Start with locked routes preserved
+        new_config = {k: v for k, v in old_config.items() if k in locked}
+
+        for row in range(table.rowCount()):
+            user_item = table.item(row, 0)
+            stream_item = table.item(row, 1)
+            if not user_item or not stream_item:
                 continue
-            user = user_item.text()
 
-            output_widget = self.ui.routingTable.cellWidget(row, 1)
-            channel_widget = self.ui.routingTable.cellWidget(row, 2)
-            output = output_widget.currentText() if output_widget else ""
-            channel = channel_widget.value() if channel_widget else 1
-            routing_config[user] = {"output": output, "channel": channel}
+            user = user_item.text().strip()
+            # If you display "kbd1 🔒", strip the lock symbol
+            stream = stream_item.data(QtCore.Qt.UserRole) or stream_item.text().replace("🔒", "").strip()
 
-        self.main_app.routing_config = routing_config
-        print("🎛️ Routing Config Updated:", routing_config)
-        self.accept()
+            key = (user, stream)
+            if key in locked:
+                continue  # don't overwrite locked routes
+
+            output_combo = table.cellWidget(row, 2)
+            channel_spin = table.cellWidget(row, 3)
+
+            output_name = output_combo.currentText().strip() if output_combo else ""
+            channel = channel_spin.value() if channel_spin else 1
+
+            if output_name:
+                new_config[key] = {"output": output_name, "channel": channel}
+
+        self.main_app.routing_config = new_config
+        print("✅ Updated routing_config:", self.main_app.routing_config)
+        self.close()
 
 
 class RoomSettingsWindow(QMainWindow):
@@ -663,13 +1231,11 @@ class RoomSettingsWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter a room name")
             return
         if not self.parent().username:
-            username = self.parent().ui.usernamelineEdit.text().strip()
-            if not username:
-                QMessageBox.warning(self, "No Username", "Please enter a username.")
-                return
-            self.parent().username = username
+            QMessageBox.warning(self, "No Username", "Username not initialized.")
+            return
 
         if self.parent():
+            self.parent().ensure_vmidi_bridge()
             self.parent().selected_room = room_name
             self.parent().max_participants = max_participants
             self.parent().recording_enabled = recording_enabled
@@ -685,20 +1251,259 @@ class RoomSettingsWindow(QMainWindow):
 class MidiUserApp(QMainWindow):
     def __init__(self):
         super().__init__()
+        import os
+        import re
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
         self.username = ""
+        # Hide old username input widgets from the main window
+        self.ui.usernamelabel.hide()
+        self.ui.usernamelineEdit.hide()
+
+        self.username_display = QtWidgets.QLabel(self.ui.centralwidget)
+        self.username_display.setObjectName("username_display")
+        self.username_display.setGeometry(QtCore.QRect(860, 10, 220, 24))
+        self.username_display.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.username_display.setStyleSheet("font-weight: bold;")
+        self.username_display.setText("User: -")
         self.selected_room = "lobby"
-        self.selected_input = ""
+        self.selected_inputs = []
         self.selected_output = ""
+        self.local_stream_outputs = {}
         self.ui.joinRoomButton.clicked.connect(lambda: asyncio.create_task(self.connect_to_room()))
         self.ui.createRoomButton.clicked.connect(self.open_room_settings)
         self.ui.actionMIDIsettings.triggered.connect(self.open_settings_window)
         asyncio.get_event_loop().create_task(self.listen_for_rooms())
         self.ws = None
-        self.routing_config = {}
         self.room_window = None
+        self.room_leader = None
+        # ---- MIDIrooms auto-routing state ----
+        self.remote_port_pool = [f"MIDIrooms_Remote_{i}" for i in range(1, 65)]
+        # ---- virtualMIDI bridge ----
+        self.vmidi = None
+        self.local_vmidi_ports = {}
+        self.created_vmidi_ports = set()  # all ports created via bridge (local + remote)
+        self.pid = os.getpid()
+        self.routing_config = getattr(self, "routing_config", {})
+        self.locked_routes = getattr(self, "locked_routes", set())
+        self.seen_streams = getattr(self, "seen_streams", set())
+        self.stream_meta = getattr(self, "stream_meta", {})
+        self.stream_pretty = getattr(self, "stream_pretty", {})
+        self.stream_portname = getattr(self, "stream_portname", {})
+        self.ensure_vmidi_bridge()
+        self.instance_suffix = f"{os.getpid() % 100:02d}"
 
+    def debug_dump_midi_ports(self, label=""):
+        try:
+            ins = mido.get_input_names()
+        except Exception as e:
+            ins = [f"<error reading inputs: {e}>"]
+
+        try:
+            outs = mido.get_output_names()
+        except Exception as e:
+            outs = [f"<error reading outputs: {e}>"]
+
+        print(f"\n===== MIDI PORT SNAPSHOT {label} =====")
+        print("CREATED BY APP:")
+        for x in sorted(getattr(self, "created_vmidi_ports", set())):
+            print("  APP:", x)
+
+        print("LOCAL PORT MAP:")
+        for k, v in getattr(self, "local_vmidi_ports", {}).items():
+            print(f"  {k} -> {v}")
+
+        print("INPUTS:")
+        for x in ins:
+            print("  IN :", x)
+
+        print("OUTPUTS:")
+        for x in outs:
+            print("  OUT:", x)
+
+        print("=====================================\n")
+
+    def ensure_vmidi_bridge(self):
+        if getattr(self, "vmidi", None):
+            return
+        try:
+            import os
+            exe_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midiroomsports.exe")
+            print("DEBUG helper exe path:", exe_path)
+            self.vmidi = VirtualMidiBridge(exe_path)
+            print("✅ vmidi bridge started")
+        except Exception as e:
+            self.vmidi = None
+            print("❌ Could not start midiroomsports.exe:", e)
+
+    def refresh_username_label(self):
+        if hasattr(self, "username_display"):
+            self.username_display.setText(f"User: {self.username or '-'}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "username_display"):
+            self.username_display.setGeometry(self.width() - 240, 10, 220, 24)
+    def sanitize_vmidi_name(self, s: str, max_len: int = 31) -> str:
+        s = (s or "").strip()
+        s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return (s[:max_len] or "midiport")
+
+    def _tag(self, s: str, n: int) -> str:
+        s = re.sub(r"[^A-Za-z0-9]+", "", (s or "").strip()).lower()
+        return (s[:n] or "x")
+
+    def _dev_tag(self, dev_name: str, n: int = 4) -> str:
+        dn = (dev_name or "").lower()
+        if "mpk" in dn: return "mpk"
+        if "akai" in dn: return "akai"
+        if "launchkey" in dn: return "lk"
+        if "novation" in dn: return "nov"
+        if "keyboard" in dn or "key" in dn: return "key"
+        if "pad" in dn: return "pad"
+        if "drum" in dn: return "drm"
+        return self._tag(dev_name, n)
+
+    def _stream_idx(self, stream_id: str, fallback: int = 1) -> int:
+        m = re.search(r"_(\d+)$", stream_id or "")
+        return int(m.group(1)) if m else fallback
+
+    def _short_user(self, username: str, n: int = 8) -> str:
+        return self._tag(username or "user", n)
+
+    def _short_dev(self, dev_name: str, n: int = 4) -> str:
+        return self._dev_tag(dev_name, n)
+
+    def _suffix(self) -> str:
+        s = getattr(self, "instance_suffix", "X")
+        s = re.sub(r"[^A-Za-z0-9]+", "", str(s))[:2]
+        return s or "X"
+
+    def make_local_port_name_default(self) -> str:
+        user = self._short_user(getattr(self, "username", "") or "user", 8)
+        suf = self._suffix()
+        return f"{user}_main_{suf}"[:31]
+
+    def make_local_port_name_device(self, username: str, dev_name: str, stream_id: str, idx: int) -> str:
+        user = self._short_user(username, 8)
+        dev = self._short_dev(dev_name, 4)
+        i = self._stream_idx(stream_id, idx)
+        suf = self._suffix()
+        return f"{user}_{dev}_{i}_{suf}"[:31]
+
+    def make_remote_port_name(self, sender: str, device: str, stream_id: str) -> str:
+        user = self._short_user(sender, 8)
+        dev = self._short_dev(device, 4)
+        i = self._stream_idx(stream_id, 1)
+        suf = self._suffix()
+        return f"{user}_{dev}_{i}_{suf}"[:31]
+
+    def make_stream_id(self, dev_name: str, idx: int) -> str:
+        base = "".join(c if c.isalnum() else "_" for c in (dev_name or "device")).strip("_")
+        base = "_".join(base.split("_"))
+        base = base[:24] if base else f"dev{idx}"
+        return f"{base}_{idx}"
+
+    def ensure_local_vmidi_ports(self):
+        """
+        Create 1 local vmidi OUT port per selected input device (stream).
+        These are extra per-device ports, not the persistent LOCAL_MAIN.
+        """
+        self.ensure_vmidi_bridge()
+        if not self.vmidi:
+            return
+
+        if not isinstance(getattr(self, "local_vmidi_ports", None), dict):
+            self.local_vmidi_ports = {}
+        if not isinstance(getattr(self, "created_vmidi_ports", None), set):
+            self.created_vmidi_ports = set()
+
+        selected_inputs = getattr(self, "selected_inputs", None)
+        if not selected_inputs:
+            one = getattr(self, "selected_input", None)
+            selected_inputs = [one] if one else []
+
+        # No selected input devices -> do nothing here
+        if not selected_inputs:
+            return
+
+        username = getattr(self, "username", "") or "user"
+
+        desired = {}
+        for idx, dev_name in enumerate(selected_inputs, start=1):
+            stream_id = self.make_stream_id(dev_name, idx)
+            port_name = self.make_local_port_name_device(username, dev_name, stream_id, idx)
+            desired[stream_id] = port_name
+
+        # Close only per-device ports that are no longer desired
+        for stream_id, port_name in list(self.local_vmidi_ports.items()):
+            if stream_id == "LOCAL_MAIN":
+                continue
+
+            if stream_id not in desired:
+                try:
+                    self.vmidi.close(port_name)
+                except Exception:
+                    pass
+                self.created_vmidi_ports.discard(port_name)
+                del self.local_vmidi_ports[stream_id]
+                if isinstance(getattr(self, "selected_outputs", None), list):
+                    self.selected_outputs = [x for x in self.selected_outputs if x != port_name]
+
+        # Create missing per-device ports
+        for stream_id, port_name in desired.items():
+            if stream_id in self.local_vmidi_ports:
+                continue
+
+            ok = self.vmidi.create(port_name)
+            if ok:
+                self.local_vmidi_ports[stream_id] = port_name
+                self.created_vmidi_ports.add(port_name)
+                print(f"✅ Created LOCAL vmidi port: {stream_id} -> {port_name}")
+                self.debug_dump_midi_ports(f"after create local {port_name}")
+                QtCore.QTimer.singleShot(
+                    1000,
+                    lambda pn=port_name: self.debug_dump_midi_ports(f"1s later after create local {pn}")
+                )
+            else:
+                print(f"❌ Failed to create LOCAL vmidi port: {port_name}")
+
+    def ensure_main_local_port(self):
+        """
+        Create the persistent LOCAL_MAIN vmidi port once, based only on username.
+        This port should live until the whole app closes.
+        """
+        self.ensure_vmidi_bridge()
+        if not self.vmidi:
+            return None
+
+        if not isinstance(getattr(self, "local_vmidi_ports", None), dict):
+            self.local_vmidi_ports = {}
+        if not isinstance(getattr(self, "created_vmidi_ports", None), set):
+            self.created_vmidi_ports = set()
+
+        stream_id = "LOCAL_MAIN"
+
+        if stream_id in self.local_vmidi_ports:
+            return self.local_vmidi_ports[stream_id]
+
+        port_name = self.make_local_port_name_default()
+        ok = self.vmidi.create(port_name)
+
+        if ok:
+            self.local_vmidi_ports[stream_id] = port_name
+            self.created_vmidi_ports.add(port_name)
+            print(f"✅ Created persistent LOCAL_MAIN port: {stream_id} -> {port_name}")
+            self.debug_dump_midi_ports(f"after create persistent LOCAL_MAIN {port_name}")
+            QtCore.QTimer.singleShot(
+                1000,
+                lambda pn=port_name: self.debug_dump_midi_ports(f"1s later after create persistent LOCAL_MAIN {pn}")
+            )
+            return port_name
+
+        print(f"❌ Failed to create persistent LOCAL_MAIN port: {port_name}")
+        return None
     async def handle_offer(self, data):
         print("📩 handle_offer called for", self.username)
 
@@ -773,8 +1578,17 @@ class MidiUserApp(QMainWindow):
                                 # If I'm the creator and a peer is present, kick off the offer once.
                                 if self.room_window.is_creator and not self.room_window.offer_sent and len(users) >= 2:
                                     asyncio.get_event_loop().create_task(self.room_window.start_offer())
+                        elif data["type"] == "leader":
+                            leader = data.get("leader")
+                            if self.room_window and data.get("room") == self.room_window.room_name:
+                                self.room_leader = leader
+                                self.room_window.update_leader_ui(leader)
 
-
+                        elif data["type"] == "kicked":
+                            if self.room_window and data.get("room") == self.room_window.room_name:
+                                by = data.get("by", "leader")
+                                QMessageBox.warning(self.room_window, "Kicked", f"You were kicked by {by}.")
+                                self.room_window.leave_room()
                         elif data["type"] == "offer":
                             print("📨 Received OFFER message:", data)
                             await self.handle_offer(data)
@@ -796,9 +1610,8 @@ class MidiUserApp(QMainWindow):
         self.ui.serverListWidget.addItems(rooms)
 
     async def connect_to_room(self):
-        username = self.ui.usernamelineEdit.text().strip()
-        if not username:
-            QMessageBox.warning(self, "No Username", "Please enter a username.")
+        if not self.username:
+            QMessageBox.warning(self, "No Username", "Username not initialized.")
             return
 
         selected = self.ui.serverListWidget.selectedItems()
@@ -806,8 +1619,8 @@ class MidiUserApp(QMainWindow):
             QMessageBox.warning(self, "No Room", "Please select a room first.")
             return
 
-        self.username = username
         self.selected_room = selected[0].text()
+        self.ensure_vmidi_bridge()
 
         self.hide()
         self.room_window = RoomWindow(self, room_name=self.selected_room, is_creator=False)
@@ -816,9 +1629,7 @@ class MidiUserApp(QMainWindow):
 
         loop = asyncio.get_event_loop()
         loop.create_task(self.room_window.start_webrtc())
-        # Wait a brief moment so the peer connection exists before offers arrive
         await asyncio.sleep(0.2)
-
     def open_settings_window(self):
         self.settings_window = SettingsWindow(self)
         self.settings_window.show()
@@ -827,54 +1638,168 @@ class MidiUserApp(QMainWindow):
         dlg = RoomSettingsWindow(self)
         dlg.show()
 
+    def closeEvent(self, event):
+        # Close ALL vmidi ports we created (local + remote)
+        try:
+            if getattr(self, "vmidi", None):
+                for name in list(self.created_vmidi_ports):
+                    try:
+                        self.vmidi.close(name)
+                    except Exception:
+                        pass
+                self.created_vmidi_ports.clear()
+
+                try:
+                    self.vmidi.shutdown()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        event.accept()
+
 
 class SettingsWindow(QMainWindow):
     def __init__(self, main_app=None):
         super().__init__()
-        self.ui = Ui_Form()
+        self.ui = Ui_SettingsForm()
         self.ui.setupUi(self)
         self.setWindowTitle("Settings")
-        self.ui.inputCombo.addItems(mido.get_input_names())
-        self.ui.outputCombo.addItems(mido.get_output_names())
         self.main_app = main_app
         self.ui.applyButton.clicked.connect(self.apply_settings)
         self.ui.cancelButton.clicked.connect(self.close)
+        self.load_midi_devices()
+
+    def _get_checked_outputs_from_ui(self) -> list[str]:
+        selected = []
+        for i in range(self.ui.outputsList.count()):
+            item = self.ui.outputsList.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                selected.append(item.text())
+        return selected
+
+    def _refresh_outputs_list(self):
+        """Outputs = destinations the app can send to (local vmidi + system MIDI outputs)."""
+        import mido
+        from PyQt5 import QtCore, QtWidgets
+
+        self.ui.outputsList.clear()
+        if not self.main_app:
+            return
+
+        enabled = set(getattr(self.main_app, "selected_outputs", []) or [])
+
+        # 1) Local playback ports created by our app
+        local_ports = list(getattr(self.main_app, "local_vmidi_ports", {}).values())
+
+        # 2) Optional: also show real system MIDI outputs
+        sys_outputs = list(mido.get_output_names())
+
+        # Combine (local ports first so they’re easy to find)
+        all_outputs = []
+        for p in local_ports:
+            if p not in all_outputs:
+                all_outputs.append(p)
+        for o in sys_outputs:
+            if o not in all_outputs:
+                all_outputs.append(o)
+
+        for name in all_outputs:
+            item = QtWidgets.QListWidgetItem(name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+
+            # default behavior: if user hasn't saved anything yet,
+            # check local ports by default, leave system outputs unchecked
+            if enabled:
+                item.setCheckState(QtCore.Qt.Checked if name in enabled else QtCore.Qt.Unchecked)
+            else:
+                item.setCheckState(QtCore.Qt.Checked if name in local_ports else QtCore.Qt.Unchecked)
+
+            self.ui.outputsList.addItem(item)
+
+    def load_midi_devices(self):
+        import mido
+        from PyQt5 import QtCore, QtWidgets
+
+        self.ui.inputsList.clear()
+
+        created = getattr(self.main_app, "created_vmidi_ports", set()) if self.main_app else set()
+
+        # Only show REAL inputs (exclude our created ports)
+        input_names = [
+            n for n in mido.get_input_names()
+            if n not in created and not n.lower().startswith("midirooms.")
+        ]
+
+        selected_inputs = getattr(self.main_app, "selected_inputs", [])
+
+        for name in input_names:
+            item = QtWidgets.QListWidgetItem(name)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            item.setCheckState(QtCore.Qt.Checked if name in selected_inputs else QtCore.Qt.Unchecked)
+            self.ui.inputsList.addItem(item)
+
+        # outputsList will be filled AFTER local ports are created (in showEvent)
+        self.ui.outputsList.clear()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_outputs_list()
+
+    def _get_checked_inputs_from_ui(self) -> list[str]:
+        selected = []
+        for i in range(self.ui.inputsList.count()):
+            item = self.ui.inputsList.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                selected.append(item.text())
+        return selected
+
+    def _create_local_ports_now_and_refresh_outputs(self):
+        if not self.main_app:
+            return
+
+        selected = self._get_checked_inputs_from_ui()
+        self.main_app.selected_inputs = selected
+
+        self.main_app.ensure_local_vmidi_ports()
+
+        self._refresh_outputs_list()
+        self.main_app.selected_outputs = self._get_checked_outputs_from_ui()
 
     def apply_settings(self):
-        selected_input = self.ui.inputCombo.currentText()
-        selected_output = self.ui.outputCombo.currentText()
+        selected_inputs = self._get_checked_inputs_from_ui()
+        selected_outputs = self._get_checked_outputs_from_ui()
 
         if self.main_app:
-            # Save globally on the main app for later use
-            self.main_app.selected_input = selected_input
-            self.main_app.selected_output = selected_output
+            self.main_app.selected_inputs = selected_inputs
+            self.main_app.selected_outputs = selected_outputs
 
-            # Also store under consistent names used by RoomWindow
-            self.main_app.midi_input_name = selected_input
-            self.main_app.midi_output_name = selected_output
+            # Create/update per-device local ports here
+            self.main_app.ensure_local_vmidi_ports()
+
+            # Refresh list after creation
+            self._refresh_outputs_list()
 
             QMessageBox.information(
                 self,
                 "MIDI Settings Applied",
-                f"Input: {selected_input}\nOutput: {selected_output}"
+                f"Inputs: {selected_inputs}\nLocal outputs: {selected_outputs}"
             )
 
         self.close()
 
 
-def main():
-    app = QApplication(sys.argv)
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
 
-    loop = QEventLoop(app)
-    asyncio.set_event_loop(loop)
+    dlg = UsernameDialog()
+    if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        sys.exit(0)
 
     window = MidiUserApp()
+    window.username = dlg.username
+    window.refresh_username_label()
+    window.ensure_main_local_port()
+
     window.show()
-
-    with loop:
-        loop.run_forever()
-
-
-
-if __name__ == "__main__":
-    main()
+    sys.exit(app.exec_())
