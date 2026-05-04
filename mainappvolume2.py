@@ -286,6 +286,7 @@ class RoomWindow(QWidget):
                 print("⚠️ MIDI rescan failed:", e)
 
             self.main_app.midi_service_was_refreshed = False
+
         # Poll MIDI input
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.poll_midi_input)
