@@ -262,8 +262,6 @@ class RoomWindow(QWidget):
         # Use preselected ports from settings
         # Use preselected ports from settings
         self.midi_inputs = []  # list of (stream_id, mido_input_port)
-        self.midi_output = None
-        self.output_ports_cache = {}
         self.stream_devices = {}  # stream_id -> device name
 
         from mido import open_input, open_output
@@ -274,42 +272,20 @@ class RoomWindow(QWidget):
             one = getattr(self.main_app, "selected_input", None)
             selected_inputs = [one] if one else []
 
-        selected_out = getattr(self.main_app, "selected_output", None)
-
         self.failed_inputs = set()
+        if getattr(self.main_app, "midi_service_was_refreshed", False):
+            print("⏳ Waiting after MIDI service refresh...")
+            QtWidgets.QApplication.processEvents()
+            time.sleep(3.0)
 
-        for idx, dev_name in enumerate(selected_inputs, start=1):
+            # Force mido/WinMM to re-enumerate fresh
             try:
-                stream_id = self.main_app.make_stream_id(dev_name, idx)
-                inport = open_input(dev_name)
-                self.midi_inputs.append((stream_id, inport))
-                self.stream_devices[stream_id] = dev_name
-                # ✅ Ensure local vmidi output port exists for THIS exact stream_id
-                try:
-                    self.main_app.ensure_vmidi_bridge()
-                    if getattr(self.main_app, "vmidi", None):
-                        if stream_id not in self.main_app.local_vmidi_ports:
-                            username = getattr(self.main_app, "username",
-                                               "") or "user"
-                            port_name = self.main_app.make_local_port_name_device(username, dev_name, stream_id, idx)
-                            ok = self.main_app.vmidi.create(port_name)
-                            if ok:
-                                self.main_app.local_vmidi_ports[stream_id] = port_name
-                                self.main_app.created_vmidi_ports.add(port_name)
-                                self.main_app.debug_dump_midi_ports(f"after ensure local in RoomWindow {port_name}")
-                                # optional: auto-enable it if nothing selected yet
-                                if isinstance(getattr(self.main_app, "selected_outputs", None), list) and len(
-                                        self.main_app.selected_outputs) == 0:
-                                    self.main_app.selected_outputs = [port_name]
-                                print(f"✅ Ensured local vmidi port for {stream_id}: {port_name}")
-                            else:
-                                print(f"❌ Failed to ensure local vmidi port for {stream_id}: {port_name}")
-                except Exception as e:
-                    print("⚠️ ensure local vmidi in RoomWindow failed:", e)
+                print("🔄 Fresh MIDI inputs:", mido.get_input_names())
+                print("🔄 Fresh MIDI outputs:", mido.get_output_names())
             except Exception as e:
-                self.failed_inputs.add(dev_name.lower())
-                print(f"⚠️ Failed to open input {dev_name}: {e}")
+                print("⚠️ MIDI rescan failed:", e)
 
+            self.main_app.midi_service_was_refreshed = False
         # Poll MIDI input
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.poll_midi_input)
@@ -320,6 +296,65 @@ class RoomWindow(QWidget):
         self.hotplug_timer = QtCore.QTimer()
         self.hotplug_timer.timeout.connect(self.scan_new_midi_inputs)
         self.hotplug_timer.start(3000)  # every 3 seconds
+        QtCore.QTimer.singleShot(3500, self.init_midi_inputs)
+
+    def init_midi_inputs(self):
+        import mido
+
+        print("🚀 Initializing MIDI inputs AFTER delay...")
+
+        self.midi_inputs = []
+        self.stream_devices = {}
+
+        selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+
+        available_inputs = mido.get_input_names()
+        print("🎹 Available inputs after delay:", available_inputs)
+
+        for idx, dev_name in enumerate(selected_inputs, start=1):
+            inport = self.open_midi_input_with_retry(dev_name)
+
+            if not inport:
+                print(f"❌ Could not open MIDI input: {dev_name}")
+                continue
+
+            stream_id = self.main_app.make_stream_id(dev_name, idx)
+
+            self.midi_inputs.append((stream_id, inport))
+            self.stream_devices[stream_id] = dev_name
+
+            print(f"✅ Opened MIDI input: {dev_name}")
+
+    def open_midi_input_with_retry(self, dev_name, retries=12, delay_ms=1000):
+        from mido import open_input
+        import time
+
+        for attempt in range(1, retries + 1):
+            try:
+                available = mido.get_input_names()
+                print(f"🔎 Available MIDI inputs attempt {attempt}: {available}")
+
+                real_name = next((n for n in available if n == dev_name), None)
+
+                if not real_name:
+                    # fallback για cases τύπου "MPK mini 3 0" vs renamed instance
+                    base = dev_name.lower().split(" 0")[0]
+                    real_name = next((n for n in available if base in n.lower()), None)
+
+                if not real_name:
+                    print(f"⚠️ {dev_name} not visible yet")
+                    time.sleep(delay_ms / 1000)
+                    continue
+
+                print(f"🎹 Trying to open MIDI input {real_name} ({attempt}/{retries})")
+                return open_input(real_name)
+
+            except Exception as e:
+                print(f"⚠️ Failed attempt {attempt}/{retries} opening {dev_name}: {e}")
+                time.sleep(delay_ms / 1000)
+
+        return None
+
 
     def send_streams_announce(self):
         if not self.channel or getattr(self.channel, "readyState", None) != "open":
@@ -556,14 +591,6 @@ class RoomWindow(QWidget):
             self.hotplug_timer.stop()
         except Exception:
             pass
-
-        # Close cached output ports
-        for name, port in list(self.output_ports_cache.items()):
-            try:
-                port.close()
-            except Exception:
-                pass
-        self.output_ports_cache.clear()
         # Close ALL remote vmidi ports created for this room session
         # Close ALL remote vmidi ports created for this room session
         try:
@@ -681,18 +708,12 @@ class RoomWindow(QWidget):
                             if not getattr(self, "local_mute", False) and getattr(self.main_app, "vmidi", None):
                                 try:
                                     local_port = getattr(self.main_app, "local_vmidi_ports", {}).get(stream_id)
-
-                                    enabled_list = getattr(self.main_app, "selected_outputs", []) or []
-                                    enabled = None if any("main" in x for x in enabled_list) or len(
-                                        enabled_list) == 0 else set(enabled_list)
-
-                                    if local_port and (enabled is None or local_port in enabled):
+                                    if local_port:
                                         b = msg.bytes()
                                         hex_bytes = " ".join(f"{x:02X}" for x in b)
                                         self.main_app.vmidi.send_hex(local_port, hex_bytes)
                                     else:
-                                        print(f"⚠️ Local output disabled or missing for stream {stream_id} "
-                                              f"(local_port={local_port}, enabled={enabled_list})")
+                                        print(f"⚠️ Missing local output port for stream {stream_id}")
 
                                 except Exception as e:
                                     print("⚠️ vmidi local send error:", e)
@@ -1268,8 +1289,6 @@ class MidiUserApp(QMainWindow):
         self.username_display.setText("User: -")
         self.selected_room = "lobby"
         self.selected_inputs = []
-        self.selected_output = ""
-        self.local_stream_outputs = {}
         self.ui.joinRoomButton.clicked.connect(lambda: asyncio.create_task(self.connect_to_room()))
         self.ui.createRoomButton.clicked.connect(self.open_room_settings)
         self.ui.actionMIDIsettings.triggered.connect(self.open_settings_window)
@@ -1386,11 +1405,10 @@ class MidiUserApp(QMainWindow):
         return f"{user}_main_{suf}"[:31]
 
     def make_local_port_name_device(self, username: str, dev_name: str, stream_id: str, idx: int) -> str:
-        user = self._short_user(username, 8)
-        dev = self._short_dev(dev_name, 4)
-        i = self._stream_idx(stream_id, idx)
-        suf = self._suffix()
-        return f"{user}_{dev}_{i}_{suf}"[:31]
+        user = self.sanitize_vmidi_name(username, 10)
+        dev = self.sanitize_vmidi_name(dev_name, 18)
+        name = f"{user}-{dev}"
+        return name[:31]
 
     def make_remote_port_name(self, sender: str, device: str, stream_id: str) -> str:
         user = self._short_user(sender, 8)
@@ -1630,6 +1648,30 @@ class MidiUserApp(QMainWindow):
         loop = asyncio.get_event_loop()
         loop.create_task(self.room_window.start_webrtc())
         await asyncio.sleep(0.2)
+
+    def refresh_midi_state(self):
+        print("🔄 Refreshing MIDI state...")
+
+        # Close cached Python-side mido outputs to virtual ports.
+        # This does NOT close/destroy the virtual ports themselves.
+        try:
+            if getattr(self, "vmidi", None):
+                for name, out in list(self.vmidi.output_cache.items()):
+                    try:
+                        out.close()
+                    except Exception:
+                        pass
+                self.vmidi.output_cache.clear()
+        except Exception as e:
+            print("⚠️ refresh_midi_state output cache cleanup error:", e)
+
+        try:
+            print("INPUTS after refresh:", mido.get_input_names())
+            print("OUTPUTS after refresh:", mido.get_output_names())
+        except Exception as e:
+            print("⚠️ refresh_midi_state mido query error:", e)
+
+        print("✅ MIDI state refresh done")
     def open_settings_window(self):
         self.settings_window = SettingsWindow(self)
         self.settings_window.show()
@@ -1670,53 +1712,6 @@ class SettingsWindow(QMainWindow):
         self.ui.cancelButton.clicked.connect(self.close)
         self.load_midi_devices()
 
-    def _get_checked_outputs_from_ui(self) -> list[str]:
-        selected = []
-        for i in range(self.ui.outputsList.count()):
-            item = self.ui.outputsList.item(i)
-            if item.checkState() == QtCore.Qt.Checked:
-                selected.append(item.text())
-        return selected
-
-    def _refresh_outputs_list(self):
-        """Outputs = destinations the app can send to (local vmidi + system MIDI outputs)."""
-        import mido
-        from PyQt5 import QtCore, QtWidgets
-
-        self.ui.outputsList.clear()
-        if not self.main_app:
-            return
-
-        enabled = set(getattr(self.main_app, "selected_outputs", []) or [])
-
-        # 1) Local playback ports created by our app
-        local_ports = list(getattr(self.main_app, "local_vmidi_ports", {}).values())
-
-        # 2) Optional: also show real system MIDI outputs
-        sys_outputs = list(mido.get_output_names())
-
-        # Combine (local ports first so they’re easy to find)
-        all_outputs = []
-        for p in local_ports:
-            if p not in all_outputs:
-                all_outputs.append(p)
-        for o in sys_outputs:
-            if o not in all_outputs:
-                all_outputs.append(o)
-
-        for name in all_outputs:
-            item = QtWidgets.QListWidgetItem(name)
-            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-
-            # default behavior: if user hasn't saved anything yet,
-            # check local ports by default, leave system outputs unchecked
-            if enabled:
-                item.setCheckState(QtCore.Qt.Checked if name in enabled else QtCore.Qt.Unchecked)
-            else:
-                item.setCheckState(QtCore.Qt.Checked if name in local_ports else QtCore.Qt.Unchecked)
-
-            self.ui.outputsList.addItem(item)
-
     def load_midi_devices(self):
         import mido
         from PyQt5 import QtCore, QtWidgets
@@ -1739,12 +1734,11 @@ class SettingsWindow(QMainWindow):
             item.setCheckState(QtCore.Qt.Checked if name in selected_inputs else QtCore.Qt.Unchecked)
             self.ui.inputsList.addItem(item)
 
-        # outputsList will be filled AFTER local ports are created (in showEvent)
-        self.ui.outputsList.clear()
-
     def showEvent(self, event):
         super().showEvent(event)
-        self._refresh_outputs_list()
+        if self.main_app:
+            self.main_app.refresh_midi_state()
+        self.load_midi_devices()
 
     def _get_checked_inputs_from_ui(self) -> list[str]:
         selected = []
@@ -1754,43 +1748,28 @@ class SettingsWindow(QMainWindow):
                 selected.append(item.text())
         return selected
 
-    def _create_local_ports_now_and_refresh_outputs(self):
-        if not self.main_app:
-            return
-
-        selected = self._get_checked_inputs_from_ui()
-        self.main_app.selected_inputs = selected
-
-        self.main_app.ensure_local_vmidi_ports()
-
-        self._refresh_outputs_list()
-        self.main_app.selected_outputs = self._get_checked_outputs_from_ui()
-
     def apply_settings(self):
         selected_inputs = self._get_checked_inputs_from_ui()
-        selected_outputs = self._get_checked_outputs_from_ui()
-
         if self.main_app:
             self.main_app.selected_inputs = selected_inputs
-            self.main_app.selected_outputs = selected_outputs
 
-            # Create/update per-device local ports here
             self.main_app.ensure_local_vmidi_ports()
-
-            # Refresh list after creation
-            self._refresh_outputs_list()
+            self.main_app.midi_service_was_refreshed = True
+            self.main_app.midi_refresh_time = time.time()
 
             QMessageBox.information(
                 self,
                 "MIDI Settings Applied",
-                f"Inputs: {selected_inputs}\nLocal outputs: {selected_outputs}"
+                f"Inputs: {selected_inputs}\nLocal ports created automatically."
             )
-
         self.close()
 
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
+
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
 
     dlg = UsernameDialog()
     if dlg.exec_() != QtWidgets.QDialog.Accepted:
@@ -1799,7 +1778,7 @@ if __name__ == "__main__":
     window = MidiUserApp()
     window.username = dlg.username
     window.refresh_username_label()
-    window.ensure_main_local_port()
-
     window.show()
-    sys.exit(app.exec_())
+
+    with loop:
+        loop.run_forever()
