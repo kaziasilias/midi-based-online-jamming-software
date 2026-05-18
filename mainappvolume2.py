@@ -51,6 +51,13 @@ class VirtualMidiBridge:
         self._t.start()
         self._lock = threading.Lock()
 
+        # consume initial READY from helper
+        try:
+            first = self._q.get(timeout=2)
+            print("BRIDGE INIT <-", first)
+        except Exception:
+            print("⚠️ No READY received from bridge")
+
         # MIDI outputs opened by Python toward the virtual ports
         self.output_cache = {}
 
@@ -90,21 +97,14 @@ class VirtualMidiBridge:
 
     def send_hex(self, name: str, hex_bytes: str) -> bool:
         """
-        The C helper no longer handles SEND.
-        Python sends MIDI to the visible virtual port using mido.
+        Send MIDI through midiroomsports.exe.
+        This avoids mido.open_output(name), which may not see dynamic ports.
         """
         try:
-            if name not in self.output_cache:
-                self.output_cache[name] = mido.open_output(name)
-
-            data = [int(x, 16) for x in hex_bytes.split()]
-            msg = mido.Message.from_bytes(data)
-
-            self.output_cache[name].send(msg)
-            return True
-
+            resp = self._cmd(f"SEND|{name}|{hex_bytes}")
+            return resp.startswith("OK")
         except Exception as e:
-            print(f"❌ Failed to send MIDI to {name}: {e}")
+            print(f"❌ Failed to send MIDI through bridge to {name}: {e}")
             return False
 
     def shutdown(self):
@@ -892,8 +892,12 @@ class RoomWindow(QWidget):
                         try:
                             b = msg.bytes()
                             hex_bytes = " ".join(f"{x:02X}" for x in b)
-                            self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
-                            print(f"🎧 Routed {user}/{stream} → {vmidi_name} (ch {channel})")
+                            ok = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+
+                            if ok:
+                                print(f"🎧 Routed {user}/{stream} → {vmidi_name} (ch {channel})")
+                            else:
+                                print(f"❌ Route failed {user}/{stream} → {vmidi_name}")
                         except Exception as e:
                             print("⚠️ vmidi send error:", e)
                     else:
