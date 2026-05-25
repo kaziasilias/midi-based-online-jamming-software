@@ -252,8 +252,8 @@ class RoomWindow(QWidget):
         self.ui.bpmSpinBox.setValue(self.metronome_bpm)
         self.piano = PianoWidget(
             self,
-            start_note=21,  # A0
-            white_keys=52  # 88-key piano
+            start_note=24,  # A0
+            white_keys=49  # 88-key piano
         )
         self.metronome_port_name = f"{self.main_app.username}_metronome"[:31]
 
