@@ -119,7 +119,10 @@ async def websocket_handler(request):
 
                 if target_room and target_room in rooms and ws in rooms[target_room]:
                     rooms[target_room].discard(ws)
-                    usernames.pop(ws, None)
+                    clients.add(ws)
+
+                    # Keep username available for future actions/rejoin.
+                    usernames[ws] = leaving_user
 
                     # Leader left -> pick random remaining user (fallback)
                     if room_leader.get(target_room) == leaving_user:
