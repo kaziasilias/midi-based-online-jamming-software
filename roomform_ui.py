@@ -112,7 +112,7 @@ class Ui_roomwindow(object):
         self.startMetronomeButton.setText(_translate("roomwindow", "Start Metronome"))
         self.stopMetronomeButton.setText(_translate("roomwindow", "Stop Metronome"))
         self.muteButton.setText(_translate("roomwindow", "Mute Myself"))
-        self.routingmanagerButton.setText(_translate("roomwindow", "Routing Manager"))
+        self.routingmanagerButton.setText(_translate("roomwindow", "MIDI Port Manager"))
         self.LeaveButton.setText(_translate("roomwindow", "Leave Room"))
         self.loglabel.setText(_translate("roomwindow", "MIDI Log"))
         self.buttonsgroupBox.setTitle(_translate("roomwindow", "GroupBox"))

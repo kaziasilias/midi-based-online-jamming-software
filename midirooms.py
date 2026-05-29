@@ -243,6 +243,7 @@ class RoomWindow(QWidget):
         self.is_creator = is_creator
         self.ui = Ui_roomwindow()
         self.ui.setupUi(self)
+        self.ui.bpmSpinBox.setSuffix(" BPM")
         self.ui.StartButton.clicked.connect(self.start_recording)
         self.ui.StopButton.clicked.connect(self.stop_recording)
         self.ui.StopButton.setEnabled(False)
@@ -252,7 +253,7 @@ class RoomWindow(QWidget):
         self.ui.bpmSpinBox.setValue(self.metronome_bpm)
         self.piano = PianoWidget(
             self,
-            start_note=24,  # A0
+            start_note=24,  # C1
             white_keys=49  # 88-key piano
         )
         self.metronome_port_name = f"{self.main_app.username}_metronome"[:31]
@@ -296,6 +297,12 @@ class RoomWindow(QWidget):
         # Use preselected ports from settings
         self.midi_inputs = []  # list of (stream_id, mido_input_port)
         self.stream_devices = {}  # stream_id -> device name
+        self.clock_offset_from_peer = {}
+        self.remote_midi_queue = []
+        self.remote_playback_delay = 0.03  # 30 ms
+        self.remote_playback_timer = QtCore.QTimer()
+        self.remote_playback_timer.timeout.connect(self.process_remote_midi_queue)
+        self.remote_playback_timer.start(2)
 
         from mido import open_input, open_output
 
@@ -499,7 +506,10 @@ class RoomWindow(QWidget):
 
                 stream_id = make_stream_id(dev_name, len(self.midi_inputs) + 1)
 
-                inport = open_input(dev_name)
+                inport = self.open_midi_input_with_retry(dev_name, retries=3, delay_ms=500)
+                if not inport:
+                    print(f"⚠️ Hotplug: could not reopen {dev_name}")
+                    continue
                 self.midi_inputs.append((stream_id, inport))
                 self.stream_devices[stream_id] = dev_name
                 print(f"➕ Hotplug: opened {stream_id} = {dev_name}")
@@ -521,10 +531,10 @@ class RoomWindow(QWidget):
             if peer == self.main_app.username:
                 continue  # skip self
             payload = {
-                "type": "ping",
+                "type": "sync_ping",
                 "from": self.main_app.username,
                 "to": peer,
-                "timestamp": now,
+                "t0": time.perf_counter(),
             }
             try:
                 self.channel.send(json.dumps(payload))
@@ -731,9 +741,25 @@ class RoomWindow(QWidget):
     def poll_midi_input(self):
         if not self.midi_inputs:
             return
-        for stream_id, inport in self.midi_inputs:
-            for msg in inport.iter_pending():
-                #print(f"🎹 Got MIDI message from {stream_id}:", msg)
+        for stream_id, inport in list(self.midi_inputs):
+            try:
+                pending = list(inport.iter_pending())
+            except Exception as e:
+                print(f"⚠️ MIDI input disconnected: {stream_id}: {e}")
+
+                try:
+                    inport.close()
+                except Exception:
+                    pass
+
+                self.midi_inputs = [
+                    (sid, port) for sid, port in self.midi_inputs if sid != stream_id
+                ]
+
+                self.stream_devices.pop(stream_id, None)
+                continue
+
+            for msg in pending:
 
                 if msg.type in ("note_on", "note_off"):
                     me = self.main_app.username
@@ -747,15 +773,13 @@ class RoomWindow(QWidget):
                         velocity=velocity,
                         channel=getattr(msg, "channel", 0)
                     )
-
                     # --- Local visualization ---
                     if hasattr(self, "piano"):
                         self.piano._highlight(note, velocity > 0)
-
-                    self.bump_velocity_bar(me, velocity)
-
-
-
+                    if not self.local_mute:
+                        self.bump_velocity_bar(me, velocity)
+                    if self.local_mute:
+                        continue
                     # --- Send to others over WebRTC ---
                     # Skip network-originated messages (to prevent echo)
                     if getattr(msg, "_from_network", False):
@@ -767,7 +791,7 @@ class RoomWindow(QWidget):
                             "user": me,
                             "stream": stream_id,
                             "seq": self.midi_seq,
-                            "timestamp": time.time(),
+                            "timestamp": time.perf_counter(),
                             "note": note,
                             "velocity": velocity,
                             "type": msg.type,
@@ -804,7 +828,11 @@ class RoomWindow(QWidget):
             for b in btns:
                 if b.text() in ("Assign Leader", "Kick"):
                     b.setVisible(is_leader and user != self.main_app.username)
-
+        leader_controls_enabled = is_leader
+        self.ui.bpmSpinBox.setEnabled(leader_controls_enabled)
+        self.ui.applyBpmButton.setEnabled(leader_controls_enabled)
+        self.ui.startMetronomeButton.setEnabled(leader_controls_enabled)
+        self.ui.stopMetronomeButton.setEnabled(leader_controls_enabled)
     def on_midi_message(self, message):
         port_name = None
         try:
@@ -881,19 +909,36 @@ class RoomWindow(QWidget):
                 return
 
             # --- Handle ping/pong control ---
-            if data.get("type") == "ping" and data.get("to") == self.main_app.username:
+            if data.get("type") == "sync_ping" and data.get("to") == self.main_app.username:
+
                 reply = {
-                    "type": "pong",
+                    "type": "sync_pong",
                     "from": self.main_app.username,
                     "to": data["from"],
-                    "timestamp": data["timestamp"],
+                    "t0": data["t0"],
+                    "t1": time.perf_counter(),
                 }
+
                 if self.channel and getattr(self.channel, "readyState", None) == "open":
                     self.channel.send(json.dumps(reply))
+
                 return
 
-            if data.get("type") == "pong" and data.get("to") == self.main_app.username:
-                self.handle_pong(data)
+            if data.get("type") == "sync_pong" and data.get("to") == self.main_app.username:
+                t2 = time.perf_counter()
+                t0 = data.get("t0")
+                t1 = data.get("t1")
+                sender = data.get("from")
+                rtt = t2 - t0
+                offset = t1 - ((t0 + t2) / 2)
+                self.clock_offset_from_peer[sender] = offset
+                rtt_ms = rtt * 1000
+                if sender in self.user_latency_labels:
+                    self.user_latency_labels[sender].setText(
+                        f"Latency: {rtt_ms:.1f} ms"
+                    )
+                print(f"🕒 Sync {sender} | RTT={rtt_ms:.1f} ms | offset={offset * 1000:.1f} ms")
+
                 return
 
             # --- Skip my own loopback ---
@@ -936,58 +981,25 @@ class RoomWindow(QWidget):
             if velocity is not None:
                 self.bump_velocity_bar(user, velocity)
 
-            # --- Local playback for remote notes ---
-            # --- Routed playback for remote notes ---
-            if note is not None and velocity is not None:
-                from mido import Message, open_output
-                try:
-                    msg = Message(msg_type, note=note, velocity=velocity)
+                # --- Scheduled playback queue ---
+                if note is not None and velocity is not None:
 
+                    sender_ts = data.get("timestamp", time.perf_counter())
 
+                    offset = self.clock_offset_from_peer.get(user, 0.0)
 
-                    # Look up routing config
-                    route = self.main_app.routing_config.get((user, stream))
-                    vmidi_name = None
-                    channel = 1
+                    play_time = sender_ts - offset + self.remote_playback_delay
 
-                    if route:
-                        vmidi_name = route.get("vmidi")
-                        channel = route.get("channel", 1)
+                    self.remote_midi_queue.append({
+                        "play_time": play_time,
+                        "user": user,
+                        "stream": stream,
+                        "type": msg_type,
+                        "note": note,
+                        "velocity": velocity,
+                    })
 
-                    # Apply channel if needed
-                    msg.channel = (int(channel) - 1) if channel else 0
-
-                    if vmidi_name and getattr(self.main_app, "vmidi", None):
-                        try:
-                            b = msg.bytes()
-                            hex_bytes = " ".join(f"{x:02X}" for x in b)
-                            ok = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
-
-                            if ok:
-                                print(f"🎧 Routed {user}/{stream} → {vmidi_name} (ch {channel})")
-                            else:
-                                print(f"❌ Route failed {user}/{stream} → {vmidi_name}")
-                        except Exception as e:
-                            print("⚠️ vmidi send error:", e)
-                    else:
-                        # fallback: old behavior (optional)
-                        if self.midi_output:
-                            try:
-                                self.midi_output.send(msg)
-                                print(f"🎧 Fallback default output used for {user}")
-                            except Exception as e:
-                                print("⚠️ MIDI out error:", e)
-
-                except Exception as e:
-                    print("⚠️ MIDI out error:", e)
-                    # If a cached port became invalid, drop it so we can reopen later
-                    if port_name and port_name in self.output_ports_cache:
-                        try:
-                            self.output_ports_cache[port_name].close()
-                        except Exception:
-                            pass
-                        self.output_ports_cache.pop(port_name, None)
-
+                    self.remote_midi_queue.sort(key=lambda e: e["play_time"])
             # --- GUI Piano highlight ---
             self.ui.logArea.append(f"{user}/{stream}: {msg_type} note={note} vel={velocity}")
             if hasattr(self, "piano"):
@@ -998,6 +1010,43 @@ class RoomWindow(QWidget):
         except Exception as e:
             print("❌ Failed to parse MIDI message:", e)
 
+    def process_remote_midi_queue(self):
+        if not self.remote_midi_queue:
+            return
+
+        now = time.perf_counter()
+
+        ready = []
+        while self.remote_midi_queue and self.remote_midi_queue[0]["play_time"] <= now:
+            ready.append(self.remote_midi_queue.pop(0))
+
+        for event in ready:
+            user = event["user"]
+            stream = event["stream"]
+            msg_type = event["type"]
+            note = event["note"]
+            velocity = event["velocity"]
+
+            try:
+                msg = Message(msg_type, note=note, velocity=velocity)
+
+                route = self.main_app.routing_config.get((user, stream))
+                vmidi_name = None
+                channel = 1
+
+                if route:
+                    vmidi_name = route.get("vmidi")
+                    channel = route.get("channel", 1)
+
+                msg.channel = (int(channel) - 1) if channel else 0
+
+                if vmidi_name and getattr(self.main_app, "vmidi", None):
+                    b = msg.bytes()
+                    hex_bytes = " ".join(f"{x:02X}" for x in b)
+                    self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+
+            except Exception as e:
+                print("⚠️ Scheduled MIDI playback error:", e)
     def send_midi(self, note, velocity):
         if self.channel and self.channel.readyState == "open":
             self.midi_seq += 1
@@ -1005,13 +1054,12 @@ class RoomWindow(QWidget):
                 "user": self.main_app.username,
                 "stream": "gui",
                 "seq": self.midi_seq,
-                "timestamp": time.time(),
+                "timestamp": time.perf_counter(),
                 "note": note,
                 "velocity": velocity,
                 "type": "note_on" if velocity > 0 else "note_off",
             }
-
-        self.channel.send(json.dumps(midi_event))
+            self.channel.send(json.dumps(midi_event))
 
     def update_user_list(self, users):
         """Synchronize UI with the current list of connected users."""
@@ -1370,6 +1418,48 @@ class RoomWindow(QWidget):
             f"Recording saved locally as:\n{filename}"
         )
 
+    def process_remote_midi_queue(self):
+        if not self.remote_midi_queue:
+            return
+
+        now = time.perf_counter()
+
+        ready = []
+        while self.remote_midi_queue and self.remote_midi_queue[0]["play_time"] <= now:
+            ready.append(self.remote_midi_queue.pop(0))
+
+        for event in ready:
+            user = event["user"]
+            stream = event["stream"]
+            msg_type = event["type"]
+            note = event["note"]
+            velocity = event["velocity"]
+
+            try:
+                msg = Message(msg_type, note=note, velocity=velocity)
+
+                route = self.main_app.routing_config.get((user, stream))
+                vmidi_name = None
+                channel = 1
+
+                if route:
+                    vmidi_name = route.get("vmidi")
+                    channel = route.get("channel", 1)
+
+                msg.channel = (int(channel) - 1) if channel else 0
+
+                if vmidi_name and getattr(self.main_app, "vmidi", None):
+                    b = msg.bytes()
+                    hex_bytes = " ".join(f"{x:02X}" for x in b)
+                    ok = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+
+                    if ok:
+                        print(f"🎧 Scheduled {user}/{stream} → {vmidi_name} ch {channel}")
+                    else:
+                        print(f"❌ Scheduled route failed {user}/{stream} → {vmidi_name}")
+
+            except Exception as e:
+                print("⚠️ Scheduled MIDI playback error:", e)
     def record_midi_event(self, user, stream, msg_type, note, velocity, channel=0):
         if not getattr(self, "recording", False):
             return
@@ -1399,7 +1489,7 @@ class RoutingManager(QDialog):
         self.main_app = main_app
         self.ui = Ui_routingDialog()
         self.ui.setupUi(self)
-        self.setWindowTitle("Routing Manager")
+        self.setWindowTitle("MIDI Port Manager")
         self.ui.routingTable.setHorizontalHeaderLabels(["User", "Stream", "Output", "Channel"])
         # Connect buttons
         self.ui.refreshButton.clicked.connect(self.refresh_table)
@@ -1571,6 +1661,7 @@ class MidiUserApp(QMainWindow):
         self.selected_room = "lobby"
         self.selected_inputs = []
         self.ui.joinRoomButton.clicked.connect(lambda: asyncio.create_task(self.connect_to_room()))
+        self.ui.serverListWidget.itemDoubleClicked.connect(lambda item: asyncio.create_task(self.connect_to_room()))
         self.ui.createRoomButton.clicked.connect(self.open_room_settings)
         self.ui.actionMIDIsettings.triggered.connect(self.open_settings_window)
         asyncio.get_event_loop().create_task(self.listen_for_rooms())
@@ -1929,7 +2020,7 @@ class SettingsWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "MIDI Settings Applied",
-                f"Inputs: {selected_inputs}\nLocal ports created automatically."
+                f"Inputs: {selected_inputs}\nLocal DAW monitoring should use the physical MIDI input directly."
             )
         self.close()
 
