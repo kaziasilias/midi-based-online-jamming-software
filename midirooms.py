@@ -10,6 +10,7 @@ from routingmanager_ui import Ui_routingDialog
 from PyQt5.QtWidgets import QDialog, QComboBox, QSpinBox
 import mido
 import time
+import statistics
 import re
 from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QWidget
 from mido import Message
@@ -106,6 +107,15 @@ class VirtualMidiBridge:
         except Exception as e:
             print(f"❌ Failed to send MIDI through bridge to {name}: {e}")
             return False
+
+    def send_hex_nowait(self, name: str, hex_bytes: str):
+        """Fire-and-forget MIDI send — does not wait for OK response."""
+        try:
+            with self._lock:
+                self.p.stdin.write(f"SEND|{name}|{hex_bytes}\n")
+                self.p.stdin.flush()
+        except Exception as e:
+            print(f"❌ Bridge nowait send failed for {name}: {e}")
 
     def shutdown(self):
         for name in list(self.output_cache.keys()):
@@ -299,7 +309,9 @@ class RoomWindow(QWidget):
         self.stream_devices = {}  # stream_id -> device name
         self.clock_offset_from_peer = {}
         self.remote_midi_queue = []
-        self.remote_playback_delay = 0.03  # 30 ms
+        self.remote_playback_delay = 0.005  # 5 ms
+        self.peer_jitter = {}
+        self.rtt_samples = {}
         self.remote_playback_timer = QtCore.QTimer()
         self.remote_playback_timer.timeout.connect(self.process_remote_midi_queue)
         self.remote_playback_timer.start(2)
@@ -330,7 +342,7 @@ class RoomWindow(QWidget):
         # Poll MIDI input
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.poll_midi_input)
-        self.timer.start(2)
+        self.timer.start(1)
         self.ping_timer = QtCore.QTimer()
         self.ping_timer.timeout.connect(lambda: asyncio.ensure_future(self.send_ping()))
         self.ping_timer.start(3000)  # every 3 seconds
@@ -368,7 +380,6 @@ class RoomWindow(QWidget):
 
     def open_midi_input_with_retry(self, dev_name, retries=12, delay_ms=1000):
         from mido import open_input
-        import time
 
         for attempt in range(1, retries + 1):
             try:
@@ -543,48 +554,7 @@ class RoomWindow(QWidget):
                 print("⚠️ Failed to send ping:", e)
 
     def handle_pong(self, data):
-        sent_time = data.get("timestamp")
-        sender = data.get("from")
-
-        rtt = (time.time() - sent_time) * 1000  # ms
-
-        # NEW: store RTT samples per peer
-        if not hasattr(self, "rtt_samples"):
-            self.rtt_samples = {}
-
-        if sender not in self.rtt_samples:
-            self.rtt_samples[sender] = []
-
-        self.rtt_samples[sender].append(rtt)
-
-        # Limit to last 100 samples (optional)
-        self.rtt_samples[sender] = self.rtt_samples[sender][-100:]
-
-        # Compute jitter
-        import statistics
-        if len(self.rtt_samples[sender]) > 2:
-            jitter = statistics.stdev(self.rtt_samples[sender])
-        else:
-            jitter = 0.0
-
-        # Update label
-        if sender in self.user_latency_labels:
-            label = self.user_latency_labels[sender]
-            label.setText(f"Latency: {rtt:.1f} ms  |  Jitter: {jitter:.1f} ms")
-
-        # --- Logging for performance analysis ---
-        try:
-            timestamp = datetime.utcnow().isoformat()
-            me = getattr(self.main_app, "username", "unknown")
-            room = getattr(self, "room_name", "unknown")
-
-            with open("latency_log.csv", "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([timestamp, room, me, sender, f"{rtt:.3f}", f"{jitter:.3f}"])
-        except Exception as e:
-            print("⚠️ Failed to log latency:", e)
-
-        # Start WebRTC
+        return
 
     def on_datachannel(self, channel):
         self.channel = channel
@@ -744,6 +714,7 @@ class RoomWindow(QWidget):
         for stream_id, inport in list(self.midi_inputs):
             try:
                 pending = list(inport.iter_pending())
+                input_ts = time.perf_counter()
             except Exception as e:
                 print(f"⚠️ MIDI input disconnected: {stream_id}: {e}")
 
@@ -762,6 +733,7 @@ class RoomWindow(QWidget):
             for msg in pending:
 
                 if msg.type in ("note_on", "note_off"):
+                    input_ts = time.perf_counter()
                     me = self.main_app.username
                     note = getattr(msg, "note", None)
                     velocity = getattr(msg, "velocity", None)
@@ -792,6 +764,7 @@ class RoomWindow(QWidget):
                             "stream": stream_id,
                             "seq": self.midi_seq,
                             "timestamp": time.perf_counter(),
+                            "input_ts": input_ts,
                             "note": note,
                             "velocity": velocity,
                             "type": msg.type,
@@ -837,6 +810,13 @@ class RoomWindow(QWidget):
         port_name = None
         try:
             data = json.loads(message)
+            recv_ts = time.perf_counter()
+            if "input_ts" in data:
+                sender = data.get("user")
+                offset = self.clock_offset_from_peer.get(sender, 0.0)
+                sender_time_on_my_clock = data["input_ts"] - offset
+                print(f"PYTHON INPUT→RECEIVE = {(recv_ts - sender_time_on_my_clock) * 1000:.2f} ms")
+
             if data.get("type") == "metronome_start":
                 self.start_local_metronome(
                     data.get("bpm", 120),
@@ -933,11 +913,21 @@ class RoomWindow(QWidget):
                 offset = t1 - ((t0 + t2) / 2)
                 self.clock_offset_from_peer[sender] = offset
                 rtt_ms = rtt * 1000
+                oneway_ms = rtt_ms / 2
+                self.rtt_samples.setdefault(sender, []).append(oneway_ms)
+                self.rtt_samples[sender] = self.rtt_samples[sender][-20:]
+                if len(self.rtt_samples[sender]) > 2:
+                    jitter_ms = statistics.stdev(self.rtt_samples[sender])
+                    self.peer_jitter[sender] = jitter_ms / 1000.0  # store in seconds
+                else:
+                    jitter_ms = 0.0
+
                 if sender in self.user_latency_labels:
                     self.user_latency_labels[sender].setText(
-                        f"Latency: {rtt_ms:.1f} ms"
+                        f"Latency: {oneway_ms:.1f} ms  |  Jitter: {jitter_ms:.1f} ms"
                     )
-                print(f"🕒 Sync {sender} | RTT={rtt_ms:.1f} ms | offset={offset * 1000:.1f} ms")
+                print(
+                    f"🕒 Sync {sender} | RTT={rtt_ms:.1f} ms | offset={offset * 1000:.1f} ms | jitter={jitter_ms:.1f} ms")
 
                 return
 
@@ -988,7 +978,9 @@ class RoomWindow(QWidget):
 
                     offset = self.clock_offset_from_peer.get(user, 0.0)
 
-                    play_time = sender_ts - offset + self.remote_playback_delay
+                    jitter_s = self.peer_jitter.get(user, 0.005)
+                    adaptive_delay = max(0.005, 2.0 * jitter_s)
+                    play_time = sender_ts - offset + adaptive_delay
 
                     self.remote_midi_queue.append({
                         "play_time": play_time,
@@ -1021,6 +1013,8 @@ class RoomWindow(QWidget):
             ready.append(self.remote_midi_queue.pop(0))
 
         for event in ready:
+            actual_play_ts = time.perf_counter()
+            print(f"QUEUE PLAY ERROR = {(actual_play_ts - event['play_time']) * 1000:.2f} ms")
             user = event["user"]
             stream = event["stream"]
             msg_type = event["type"]
@@ -1043,7 +1037,11 @@ class RoomWindow(QWidget):
                 if vmidi_name and getattr(self.main_app, "vmidi", None):
                     b = msg.bytes()
                     hex_bytes = " ".join(f"{x:02X}" for x in b)
-                    self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                    # note_off και velocity=0 στέλνονται αξιόπιστα για να μην κολλάνε νότες
+                    if msg_type == "note_off" or (msg_type == "note_on" and velocity == 0):
+                        self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                    else:
+                        self.main_app.vmidi.send_hex_nowait(vmidi_name, hex_bytes)
 
             except Exception as e:
                 print("⚠️ Scheduled MIDI playback error:", e)
@@ -1210,7 +1208,8 @@ class RoomWindow(QWidget):
         if not self.channel:
             self.channel = self.pc.createDataChannel(
                 "midi",
-                ordered=True
+                ordered=False,
+                maxRetransmits=0
             )
 
             @self.channel.on("open")
@@ -1247,8 +1246,6 @@ class RoomWindow(QWidget):
         if not self.is_room_leader():
             print("⚠️ Only room leader can start metronome")
             return
-
-        import time
 
         bpm = self.ui.bpmSpinBox.value()
         start_time = time.time() + 3.0
@@ -1317,8 +1314,6 @@ class RoomWindow(QWidget):
     def metronome_tick(self):
         if not self.metronome_running or self.metronome_start_time is None:
             return
-
-        import time
 
         now = time.time()
 
@@ -1426,7 +1421,14 @@ class RoomWindow(QWidget):
 
         ready = []
         while self.remote_midi_queue and self.remote_midi_queue[0]["play_time"] <= now:
-            ready.append(self.remote_midi_queue.pop(0))
+            event = self.remote_midi_queue.pop(0)
+
+            lateness_ms = (now - event["play_time"]) * 1000
+            if lateness_ms > 35:
+                print(f"⏭️ Dropped late MIDI note: {lateness_ms:.1f} ms")
+                continue
+
+            ready.append(event)
 
         for event in ready:
             user = event["user"]
@@ -1452,6 +1454,9 @@ class RoomWindow(QWidget):
                     b = msg.bytes()
                     hex_bytes = " ".join(f"{x:02X}" for x in b)
                     ok = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                    vmidi_start = time.perf_counter()
+                    vmidi_ms = (time.perf_counter() - vmidi_start) * 1000
+                    print(f"VMIDI SEND = {vmidi_ms:.2f} ms")
 
                     if ok:
                         print(f"🎧 Scheduled {user}/{stream} → {vmidi_name} ch {channel}")
@@ -2026,6 +2031,8 @@ class SettingsWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    import ctypes
+    ctypes.windll.winmm.timeBeginPeriod(1)   # set timer resolution to 1 ms
     app = QtWidgets.QApplication(sys.argv)
 
     loop = QEventLoop(app)
@@ -2042,3 +2049,4 @@ if __name__ == "__main__":
 
     with loop:
         loop.run_forever()
+    ctypes.windll.winmm.timeEndPeriod(1)
