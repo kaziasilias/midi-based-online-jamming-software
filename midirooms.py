@@ -36,6 +36,21 @@ ice_config = RTCConfiguration(iceServers=[
 
 import subprocess, threading, queue
 
+def force_winmm_refresh():
+    """
+    Αναγκάζει το Windows WinMM να ξανακαταγράψει τις MIDI συσκευές.
+    Χρειάζεται μόνο σε Windows — σε άλλα OS δεν κάνει τίποτα.
+    """
+    try:
+        import ctypes
+        winmm = ctypes.windll.winmm
+        # Στέλνουμε WM_DEVICECHANGE μήνυμα για να αναγκάσουμε re-enumeration
+        # Ο πιο αξιόπιστος τρόπος είναι να ανοίξουμε και να κλείσουμε ένα dummy port
+        # ώστε το WinMM να ανανεώσει το internal cache
+        count = winmm.midiInGetNumDevs()
+        print(f"🔄 WinMM refresh: {count} MIDI input(s) detected")
+    except Exception as e:
+        print(f"⚠️ WinMM refresh failed: {e}")
 class VirtualMidiBridge:
     def __init__(self, exe_path: str):
         self.p = subprocess.Popen(
@@ -349,8 +364,13 @@ class RoomWindow(QWidget):
         self.hotplug_timer = QtCore.QTimer()
         self.hotplug_timer.timeout.connect(self.scan_new_midi_inputs)
         self.hotplug_timer.start(3000)  # every 3 seconds
-        QtCore.QTimer.singleShot(3500, self.init_midi_inputs)
 
+        # περιοδικό re-announce streams — ώστε αν χαθεί το πρώτο να ξαναστείλουμε
+        self.announce_timer = QtCore.QTimer()
+        self.announce_timer.timeout.connect(self.send_streams_announce)
+        self.announce_timer.start(10000)  # κάθε 10 δευτερόλεπτα
+
+        QtCore.QTimer.singleShot(3500, self.init_midi_inputs)
     def init_midi_inputs(self):
         import mido
 
@@ -480,14 +500,9 @@ class RoomWindow(QWidget):
 
         def should_ignore_input(name: str) -> bool:
             n = (name or "").lower()
-            if n in getattr(self.main_app, "created_vmidi_ports", set()):
+            vmidi_lower = {v.lower() for v in getattr(self.main_app, "created_vmidi_ports", set())}
+            if n in vmidi_lower:
                 return True
-
-            # Optional: ignore common virtual/loopback stuff that can create feedback
-            # (uncomment if you want)
-            # if "loopmidi" in n:
-            #     return True
-
             return False
 
         current_names = [n for n in mido.get_input_names() if not should_ignore_input(n)]
@@ -517,13 +532,21 @@ class RoomWindow(QWidget):
 
                 stream_id = make_stream_id(dev_name, len(self.midi_inputs) + 1)
 
-                inport = self.open_midi_input_with_retry(dev_name, retries=3, delay_ms=500)
+                inport = self.open_midi_input_with_retry(dev_name, retries=1, delay_ms=100)
                 if not inport:
-                    print(f"⚠️ Hotplug: could not reopen {dev_name}")
-                    continue
+                    print(f"⚠️ Hotplug: {dev_name} δεν είναι ακόμα διαθέσιμη, θα ξαναδοκιμαστεί")
+                    continue  # ΔΕΝ βάζουμε στο failed_inputs — ο επόμενος κύκλος θα ξαναδοκιμάσει
                 self.midi_inputs.append((stream_id, inport))
                 self.stream_devices[stream_id] = dev_name
                 print(f"➕ Hotplug: opened {stream_id} = {dev_name}")
+
+                # ειδοποίηση επανασύνδεσης στο UI log
+                self.ui.logArea.append(
+                    f"✅ MIDI device reconnected: {dev_name} — ready to use"
+                )
+                # ενημέρωσε τον πίνακα αν είναι ανοιχτός
+                if getattr(self.main_app, "routing_manager_dialog", None):
+                    self.main_app.routing_manager_dialog.refresh_table()
 
                 # announce updated stream list to peers
                 self.send_streams_announce()
@@ -531,6 +554,77 @@ class RoomWindow(QWidget):
             except Exception as e:
                 print(f"⚠️ Hotplug: failed to open {dev_name}: {e}")
 
+    def try_reopen_device(self, dev_name: str, attempt: int = 1):
+        """
+        Ασύγχρονη επαναφορά συσκευής — δεν μπλοκάρει το Qt thread.
+        Χρησιμοποιεί singleShot για να επαναλαμβάνεται χωρίς blocking.
+        """
+        MAX_ATTEMPTS = 20  # δοκίμασε έως 20 φορές (60 δευτερόλεπτα συνολικά)
+
+        # αν έχει ήδη ξανανοιχτεί, σταμάτα
+        already_open = any(
+            self.stream_devices.get(sid, "").lower() == dev_name.lower()
+            for sid, _ in self.midi_inputs
+        )
+        if already_open:
+            return
+
+        # αν δεν είναι επιλεγμένη, σταμάτα
+        selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+        if dev_name not in selected:
+            return
+
+        if attempt > MAX_ATTEMPTS:
+            self.ui.logArea.append(f"❌ Could not reconnect {dev_name} after {MAX_ATTEMPTS} attempts.")
+            print(f"❌ Giving up on {dev_name}")
+            return
+
+        # Force WinMM να ξαναδεί τις συσκευές
+        force_winmm_refresh()
+
+        try:
+            available = mido.get_input_names()
+        except Exception:
+            available = []
+
+        # ψάξε exact match ή partial match
+        real_name = next((n for n in available if n == dev_name), None)
+        if not real_name:
+            base = dev_name.lower().split(" 0")[0]
+            real_name = next((n for n in available if base in n.lower()), None)
+
+        if not real_name:
+            # δεν φαίνεται ακόμα — ξαναδοκίμασε σε 3 δευτερόλεπτα
+            print(f"⏳ [{attempt}/{MAX_ATTEMPTS}] {dev_name} not visible yet, retrying...")
+            QtCore.QTimer.singleShot(
+                3000, lambda: self.try_reopen_device(dev_name, attempt + 1)
+            )
+            return
+
+        # φαίνεται — προσπάθησε να την ανοίξεις
+        try:
+            from mido import open_input
+            inport = open_input(real_name)
+
+            stream_id = self.main_app.make_stream_id(dev_name, len(self.midi_inputs) + 1)
+            self.midi_inputs.append((stream_id, inport))
+            self.stream_devices[stream_id] = dev_name
+            self.failed_inputs.discard(dev_name.lower())
+
+            self.ui.logArea.append(f"✅ MIDI device reconnected: {dev_name} — ready to use")
+            print(f"✅ Reopened {dev_name} as {stream_id}")
+
+            if getattr(self.main_app, "routing_manager_dialog", None):
+                self.main_app.routing_manager_dialog.refresh_table()
+
+            self.send_streams_announce()
+
+        except Exception as e:
+            # η συσκευή φαίνεται αλλά δεν ανοίγει ακόμα — ξαναδοκίμασε
+            print(f"⏳ [{attempt}/{MAX_ATTEMPTS}] {dev_name} visible but not openable yet: {e}")
+            QtCore.QTimer.singleShot(
+                3000, lambda: self.try_reopen_device(dev_name, attempt + 1)
+            )
     async def send_ping(self):
         """Periodically send ping messages to every other connected user."""
         if not self.channel or getattr(self.channel, "readyState", None) != "open":
@@ -576,12 +670,6 @@ class RoomWindow(QWidget):
             QtCore.QTimer.singleShot(200, self.send_streams_announce)
 
     def leave_room(self):
-        if self.pc:
-            asyncio.ensure_future(self.pc.close())
-        self.pc = None
-        self.channel = None
-        self.offer_sent = False
-
         if self.main_app.ws:
             asyncio.get_event_loop().create_task(
                 self.main_app.ws.send(json.dumps({
@@ -591,10 +679,21 @@ class RoomWindow(QWidget):
                 }))
             )
 
-        if self.channel:
-            self.channel.close()
-        if self.pc:
-            asyncio.ensure_future(self.pc.close())
+        # κλείσε channel και pc πριν τα μηδενίσεις
+        try:
+            if self.channel:
+                self.channel.close()
+        except Exception:
+            pass
+        try:
+            if self.pc:
+                asyncio.ensure_future(self.pc.close())
+        except Exception:
+            pass
+
+        self.pc = None
+        self.channel = None
+        self.offer_sent = False
         # Stop timers first
         try:
             self.timer.stop()
@@ -605,7 +704,10 @@ class RoomWindow(QWidget):
             self.hotplug_timer.stop()
         except Exception:
             pass
-        # Close ALL remote vmidi ports created for this room session
+        try:
+            self.announce_timer.stop()
+        except Exception:
+            pass
         # Close ALL remote vmidi ports created for this room session
         try:
             if getattr(self.main_app, "vmidi", None):
@@ -637,11 +739,6 @@ class RoomWindow(QWidget):
             pass
         self.midi_inputs = []
         try:
-            if self.midi_output:
-                self.midi_output.close()
-        except Exception:
-            pass
-        try:
             self.main_app.routing_config.clear()
             self.main_app.locked_routes.clear()
             self.main_app.seen_streams.clear()
@@ -650,8 +747,6 @@ class RoomWindow(QWidget):
         except Exception:
             pass
         self.main_app.show()
-        self.close()
-
         try:
             if getattr(self.main_app, "vmidi", None) and getattr(self, "metronome_port_name", None):
                 self.main_app.vmidi.close(self.metronome_port_name)
@@ -668,6 +763,8 @@ class RoomWindow(QWidget):
             self.local_output_cache.clear()
         except Exception:
             pass
+        self.close()
+
     async def start_webrtc(self):
         if not self.main_app.ws:
             print("No signaling connection")
@@ -723,11 +820,28 @@ class RoomWindow(QWidget):
                 except Exception:
                     pass
 
+                lost_dev = self.stream_devices.get(stream_id)
+
                 self.midi_inputs = [
                     (sid, port) for sid, port in self.midi_inputs if sid != stream_id
                 ]
 
                 self.stream_devices.pop(stream_id, None)
+
+                # αφαίρεσε από failed_inputs ώστε το hotplug να μπορεί να την ξανανοίξει
+                if lost_dev:
+                    self.failed_inputs.discard(lost_dev.lower())
+                    print(f"🔌 Συσκευή αποσυνδέθηκε: {lost_dev} — αναμένουμε επανασύνδεση")
+                    self.ui.logArea.append(
+                        f"⚠️ MIDI device disconnected: {lost_dev} — waiting for reconnect..."
+                    )
+                    if getattr(self.main_app, "routing_manager_dialog", None):
+                        self.main_app.routing_manager_dialog.refresh_table()
+                    # ξεκίνα αυτόματη ασύγχρονη επαναφορά
+                    QtCore.QTimer.singleShot(
+                        3000, lambda d=lost_dev: self.try_reopen_device(d)
+                    )
+
                 continue
 
             for msg in pending:
@@ -746,6 +860,7 @@ class RoomWindow(QWidget):
                         channel=getattr(msg, "channel", 0)
                     )
                     # --- Local visualization ---
+                    self.ui.logArea.append(f"{me}/{stream_id}: {msg.type} note={note} vel={velocity}")
                     if hasattr(self, "piano"):
                         self.piano._highlight(note, velocity > 0)
                     if not self.local_mute:
@@ -865,8 +980,10 @@ class RoomWindow(QWidget):
                     self.main_app.stream_portname[key] = port_name
 
                     existing = self.main_app.routing_config.get(key, {})
+                    existing_port = existing.get("vmidi")
+                    port_actually_exists = existing_port in getattr(self.main_app, "created_vmidi_ports", set())
 
-                    if not existing.get("vmidi"):
+                    if not existing_port or not port_actually_exists:
                         if getattr(self.main_app, "vmidi", None) is None:
                             print("❌ vmidi bridge not running; cannot create ports.")
                             continue
@@ -926,8 +1043,7 @@ class RoomWindow(QWidget):
                     self.user_latency_labels[sender].setText(
                         f"Latency: {oneway_ms:.1f} ms  |  Jitter: {jitter_ms:.1f} ms"
                     )
-                print(
-                    f"🕒 Sync {sender} | RTT={rtt_ms:.1f} ms | offset={offset * 1000:.1f} ms | jitter={jitter_ms:.1f} ms")
+                print(f"🕒 Sync {sender} | RTT={rtt_ms:.1f} ms | one-way={oneway_ms:.1f} ms | offset={offset * 1000:.1f} ms | jitter={jitter_ms:.1f} ms")
 
                 return
 
@@ -968,34 +1084,32 @@ class RoomWindow(QWidget):
             self.add_user_ui(user)
 
             # Update velocity bar
-            if velocity is not None:
-                self.bump_velocity_bar(user, velocity)
+            if note is not None:
+                effective_velocity = velocity if velocity is not None else 0
 
-                # --- Scheduled playback queue ---
-                if note is not None and velocity is not None:
+                if velocity is not None:
+                    self.bump_velocity_bar(user, velocity)
 
-                    sender_ts = data.get("timestamp", time.perf_counter())
+                sender_ts = data.get("timestamp", time.perf_counter())
+                offset = self.clock_offset_from_peer.get(user, 0.0)
+                jitter_s = self.peer_jitter.get(user, 0.005)
+                adaptive_delay = max(0.005, 2.0 * jitter_s)
+                play_time = sender_ts - offset + adaptive_delay
 
-                    offset = self.clock_offset_from_peer.get(user, 0.0)
+                self.remote_midi_queue.append({
+                    "play_time": play_time,
+                    "user": user,
+                    "stream": stream,
+                    "type": msg_type,
+                    "note": note,
+                    "velocity": effective_velocity,
+                })
 
-                    jitter_s = self.peer_jitter.get(user, 0.005)
-                    adaptive_delay = max(0.005, 2.0 * jitter_s)
-                    play_time = sender_ts - offset + adaptive_delay
-
-                    self.remote_midi_queue.append({
-                        "play_time": play_time,
-                        "user": user,
-                        "stream": stream,
-                        "type": msg_type,
-                        "note": note,
-                        "velocity": velocity,
-                    })
-
-                    self.remote_midi_queue.sort(key=lambda e: e["play_time"])
+                self.remote_midi_queue.sort(key=lambda e: e["play_time"])
             # --- GUI Piano highlight ---
             self.ui.logArea.append(f"{user}/{stream}: {msg_type} note={note} vel={velocity}")
             if hasattr(self, "piano"):
-                if velocity > 0:
+                if velocity is not None and velocity > 0:
                     self.piano._highlight(note, True)
                     QtCore.QTimer.singleShot(200, lambda n=note: self.piano._highlight(n, False))
 
@@ -1014,7 +1128,6 @@ class RoomWindow(QWidget):
 
         for event in ready:
             actual_play_ts = time.perf_counter()
-            print(f"QUEUE PLAY ERROR = {(actual_play_ts - event['play_time']) * 1000:.2f} ms")
             user = event["user"]
             stream = event["stream"]
             msg_type = event["type"]
@@ -1069,6 +1182,7 @@ class RoomWindow(QWidget):
         for username in users:
             if username not in self.user_ui_elements:
                 self.add_user_ui(username)
+                QtCore.QTimer.singleShot(500, self.send_streams_announce)
 
         # 2️⃣ Remove any users who have left
         for username in list(self.user_ui_elements.keys()):
@@ -1080,7 +1194,7 @@ class RoomWindow(QWidget):
                 # Also clean up velocity + latency bars
                 self.user_velocity_bars.pop(username, None)
                 self.user_latency_labels.pop(username, None)
-        # Close any vmidi ports that belonged to this user
+                # Close any vmidi ports that belonged to this user
                 to_close = []
                 for (u, s), route in list(self.main_app.routing_config.items()):
                     if u == username:
@@ -1345,7 +1459,7 @@ class RoomWindow(QWidget):
                 hex_on = " ".join(f"{x:02X}" for x in msg_on.bytes())
                 hex_off = " ".join(f"{x:02X}" for x in msg_off.bytes())
 
-                self.main_app.vmidi.send_hex(self.metronome_port_name, hex_on)
+                self.main_app.vmidi.send_hex_nowait(self.metronome_port_name, hex_on)
 
                 QtCore.QTimer.singleShot(
                     60,
@@ -1492,16 +1606,45 @@ class RoutingManager(QDialog):
     def __init__(self, main_app):
         super().__init__()
         self.main_app = main_app
+        self.room_window = getattr(main_app, "room_window", None)
         self.ui = Ui_routingDialog()
         self.ui.setupUi(self)
         self.setWindowTitle("MIDI Port Manager")
-        self.ui.routingTable.setHorizontalHeaderLabels(["User", "Stream", "Output", "Channel"])
-        # Connect buttons
+
+        # ── Μεγάλωσε το παράθυρο ──
+        self.resize(1000, 600)
+        self.setMinimumSize(900, 500)
+
+        # ── Table: stretch να γεμίζει το παράθυρο ──
+        table = self.ui.routingTable
+        table.setGeometry(QtCore.QRect(10, 10, 980, 520))  # override fixed geometry
+        table.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding
+        )
+
+        # ── Row height μικρότερο ──
+        table.verticalHeader().setDefaultSectionSize(32)
+        table.verticalHeader().hide()  # κρύψε τον αριθμό γραμμής αριστερά
+
+        # ── 5 columns με stretch ──
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(
+            ["Type", "User / Device", "Stream / Port", "Virtual MIDI Port", "Active"]
+        )
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)  # Type
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)  # User/Device
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)  # Stream/Port
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)  # Virtual MIDI Port
+        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)  # Active
+
+        # ── Κουμπιά κάτω δεξιά ──
+        self.ui.horizontalLayoutWidget.setGeometry(QtCore.QRect(700, 545, 280, 40))
+
         self.ui.refreshButton.clicked.connect(self.refresh_table)
-        #self.ui.saveButton.clicked.connect(self.save_and_close)
         self.ui.cancelButton.clicked.connect(self.close)
 
-        # Load current config
         self.refresh_table()
 
     def get_midi_outputs(self):
@@ -1513,99 +1656,180 @@ class RoutingManager(QDialog):
             return []
 
     def refresh_table(self):
-        # Collect discovered (user, stream) pairs
-        # Collect discovered / announced / routed (user, stream) pairs
+        self.room_window = getattr(self.main_app, "room_window", None)
+        table = self.ui.routingTable
+        table.setRowCount(0)  # καθάρισε πρώτα
+
         me = self.main_app.username
 
+        # ── ΤΜΗΜΑ Α: Δικές μου συσκευές ──────────────────────────────
+        try:
+            all_inputs = mido.get_input_names()
+        except Exception:
+            all_inputs = []
+
+        vmidi_ports_lower = {v.lower() for v in getattr(self.main_app, "created_vmidi_ports", set())}
+        metronome_name = (getattr(
+            getattr(self.main_app, "room_window", None), "metronome_port_name", ""
+        ) or "").lower()
+
+        def is_vmidi_or_metronome(name: str) -> bool:
+            n = name.lower()
+            # exact match με created ports
+            if n in vmidi_ports_lower:
+                return True
+            # partial match — το Windows προσθέτει " 0" ή παρόμοιο suffix
+            for vp in vmidi_ports_lower:
+                if n.startswith(vp) or vp.startswith(n):
+                    return True
+            # metronome με οποιοδήποτε suffix
+            if metronome_name and (n.startswith(metronome_name) or metronome_name.startswith(n)):
+                return True
+            return False
+
+        physical_inputs = [n for n in all_inputs if not is_vmidi_or_metronome(n)]
+
+        selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+
+        for dev_name in physical_inputs:
+            row = table.rowCount()
+            table.insertRow(row)
+
+            # Col 0: Type
+            item_type = QtWidgets.QTableWidgetItem("🎹 Local")
+            item_type.setFlags(item_type.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, item_type)
+
+            # Col 1: Device name
+            item_dev = QtWidgets.QTableWidgetItem(dev_name)
+            item_dev.setFlags(item_dev.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 1, item_dev)
+
+            # Col 2: stream_id αν είναι ανοιχτή
+            stream_id = ""
+            if self.room_window:
+                for sid, dname in self.room_window.stream_devices.items():
+                    if dname == dev_name:
+                        stream_id = sid
+                        break
+            item_stream = QtWidgets.QTableWidgetItem(stream_id if stream_id else "—")
+            item_stream.setFlags(item_stream.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 2, item_stream)
+
+            # Col 3: N/A για local
+            item_out = QtWidgets.QTableWidgetItem("(local input)")
+            item_out.setFlags(item_out.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 3, item_out)
+
+            # Col 4: Active checkbox
+            chk = QtWidgets.QCheckBox()
+            chk.blockSignals(True)  # μην πυροδοτείς signal κατά το setChecked
+            chk.setChecked(dev_name in selected)
+            chk.blockSignals(False)  # ξαναενεργοποίησε τα signals
+            chk.stateChanged.connect(lambda state, d=dev_name: self.toggle_local_device(d, state))
+            cell_widget = QtWidgets.QWidget()
+            layout = QtWidgets.QHBoxLayout(cell_widget)
+            layout.addWidget(chk)
+            layout.setAlignment(QtCore.Qt.AlignCenter)
+            layout.setContentsMargins(0, 0, 0, 0)
+            table.setCellWidget(row, 4, cell_widget)
+
+        # ── ΤΜΗΜΑ Β: Remote peers ──────────────────────────────────────
         seen = set(getattr(self.main_app, "seen_streams", set()))
         announced = set(getattr(self.main_app, "stream_pretty", {}).keys())
         routed = set(getattr(self.main_app, "routing_config", {}).keys())
-
-        streams = sorted(seen | announced | routed)
-        streams = [(u, s) for (u, s) in streams if u != me]
-        table = self.ui.routingTable
-        table.setRowCount(len(streams))
+        remote_streams = sorted((seen | announced | routed))
+        remote_streams = [(u, s) for (u, s) in remote_streams if u != me]
 
         locked = getattr(self.main_app, "locked_routes", set())
         routing = getattr(self.main_app, "routing_config", {})
         pretty_map = getattr(self.main_app, "stream_pretty", {})
 
-        for row, (user, stream) in enumerate(streams):
+        for (user, stream) in remote_streams:
             key = (user, stream)
+            row = table.rowCount()
+            table.insertRow(row)
 
-            # ---- Column 0: User (read-only) ----
+            # Col 0: Type
+            item_type = QtWidgets.QTableWidgetItem("🌐 Remote")
+            item_type.setFlags(item_type.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, item_type)
+
+            # Col 1: User
             item_user = QtWidgets.QTableWidgetItem(user)
             item_user.setFlags(item_user.flags() & ~QtCore.Qt.ItemIsEditable)
-            table.setItem(row, 0, item_user)
+            table.setItem(row, 1, item_user)
 
-            # ---- Column 1: Stream / Pretty name (read-only) ----
-            pretty = pretty_map.get(key)
-            display = pretty if pretty else stream
-            item_stream = QtWidgets.QTableWidgetItem(display)
+            # Col 2: Stream pretty name
+            pretty = pretty_map.get(key, stream)
+            item_stream = QtWidgets.QTableWidgetItem(pretty)
             item_stream.setFlags(item_stream.flags() & ~QtCore.Qt.ItemIsEditable)
             item_stream.setData(QtCore.Qt.UserRole, stream)
-
-            # Tooltip shows the pretty name + lock status
-            tooltip_lines = []
-            if pretty:
-                tooltip_lines.append(pretty)
             if key in locked:
-                tooltip_lines.append("🔒 Auto-allocated")
-            if tooltip_lines:
-                item_stream.setToolTip("\n".join(tooltip_lines))
+                item_stream.setToolTip("🔒 Auto-allocated")
+            table.setItem(row, 2, item_stream)
 
-            table.setItem(row, 1, item_stream)
-
-            # ---- Column 2: Output (fixed text, read-only) ----
+            # Col 3: Virtual MIDI port name
             route = routing.get(key, {})
             assigned = route.get("vmidi", "")
             out_text = assigned if assigned else "(allocating...)"
-            # Show the mapping in the cell so user understands what it is
-            label = pretty if pretty else f"{user}.{stream}"
-            item_out = QtWidgets.QTableWidgetItem(f"{out_text}   ←   {label}")
+            item_out = QtWidgets.QTableWidgetItem(out_text)
             item_out.setFlags(item_out.flags() & ~QtCore.Qt.ItemIsEditable)
-            table.setItem(row, 2, item_out)
+            table.setItem(row, 3, item_out)
 
-            # ---- Column 3: Channel (fixed text, read-only) ----
-            ch = int(route.get("channel", 1) or 1)
-            item_ch = QtWidgets.QTableWidgetItem(str(ch))
-            item_ch.setFlags(item_ch.flags() & ~QtCore.Qt.ItemIsEditable)
-            table.setItem(row, 3, item_ch)
+            # Col 4: Active — πάντα ✓ για remote (δεν μπορείς να τα κλείσεις χειροκίνητα)
+            item_active = QtWidgets.QTableWidgetItem("✓")
+            item_active.setFlags(item_active.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_active.setTextAlignment(QtCore.Qt.AlignCenter)
+            table.setItem(row, 4, item_active)
 
-    def save_and_close(self):
-        table = self.ui.routingTable
-        locked = getattr(self.main_app, "locked_routes", set())
-        old_config = getattr(self.main_app, "routing_config", {})
+    def toggle_local_device(self, dev_name: str, state: int):
+        """Ενεργοποιεί ή απενεργοποιεί μια τοπική MIDI συσκευή κατά τη διάρκεια του session."""
+        selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+        room_win = getattr(self.main_app, "room_window", None)
 
-        # Start with locked routes preserved
-        new_config = {k: v for k, v in old_config.items() if k in locked}
+        if state == QtCore.Qt.Checked:
+            # ── ΕΝΕΡΓΟΠΟΙΗΣΗ ──
+            selected.add(dev_name)
+            self.main_app.selected_inputs = list(selected)
+            print(f"➕ Ενεργοποίηση συσκευής: {dev_name}")
 
-        for row in range(table.rowCount()):
-            user_item = table.item(row, 0)
-            stream_item = table.item(row, 1)
-            if not user_item or not stream_item:
-                continue
+            if room_win:
+                # άμεση ασύγχρονη επαναφορά
+                QtCore.QTimer.singleShot(
+                    500, lambda d=dev_name: room_win.try_reopen_device(d)
+                )
 
-            user = user_item.text().strip()
-            # If you display "kbd1 🔒", strip the lock symbol
-            stream = stream_item.data(QtCore.Qt.UserRole) or stream_item.text().replace("🔒", "").strip()
+        else:
+            # ── ΑΠΕΝΕΡΓΟΠΟΙΗΣΗ ──
+            selected.discard(dev_name)
+            self.main_app.selected_inputs = list(selected)
+            print(f"➖ Απενεργοποίηση συσκευής: {dev_name}")
 
-            key = (user, stream)
-            if key in locked:
-                continue  # don't overwrite locked routes
+            if room_win:
+                # βρες και κλείσε το port
+                to_remove = []
+                for sid, port in list(room_win.midi_inputs):
+                    if room_win.stream_devices.get(sid, "").lower() == dev_name.lower():
+                        try:
+                            port.close()
+                        except Exception:
+                            pass
+                        to_remove.append(sid)
 
-            output_combo = table.cellWidget(row, 2)
-            channel_spin = table.cellWidget(row, 3)
+                room_win.midi_inputs = [
+                    (s, p) for s, p in room_win.midi_inputs if s not in to_remove
+                ]
+                for sid in to_remove:
+                    room_win.stream_devices.pop(sid, None)
+                    room_win.failed_inputs.discard(dev_name.lower())
 
-            output_name = output_combo.currentText().strip() if output_combo else ""
-            channel = channel_spin.value() if channel_spin else 1
+                # ενημέρωσε τους peers ότι αυτό το stream δεν υπάρχει πια
+                room_win.send_streams_announce()
+                print(f"🔌 Έκλεισε MIDI input: {dev_name}")
 
-            if output_name:
-                new_config[key] = {"output": output_name, "channel": channel}
-
-        self.main_app.routing_config = new_config
-        print("✅ Updated routing_config:", self.main_app.routing_config)
-        self.close()
+        # ανανέωσε τον πίνακα
+        QtCore.QTimer.singleShot(200, self.refresh_table)
 
 
 class RoomSettingsWindow(QMainWindow):
