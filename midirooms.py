@@ -18,21 +18,12 @@ import websockets
 import csv
 from datetime import datetime
 from qasync import QEventLoop
-from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
+#from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
 from username import Ui_Form as Ui_UsernameForm
 
 # WebRTC signaling server
 SIGNALING_SERVER = "ws://155.207.200.166:8080/ws"  # change to your VPS
 
-# ICE servers: STUN first, TURN fallback
-ice_config = RTCConfiguration(iceServers=[
-    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-    RTCIceServer(
-        urls=["turn:your.vps.address:3478"],
-        username="webrtcuser",
-        credential="strongpassword"
-    )
-])
 
 import subprocess, threading, queue
 
@@ -654,6 +645,7 @@ class RoomWindow(QWidget):
         return
 
     def on_datachannel(self, channel):
+        return
         self.channel = channel
         print(f"📥 DataChannel received by {self.main_app.username}")
 
@@ -769,44 +761,18 @@ class RoomWindow(QWidget):
         self.close()
 
     async def start_webrtc(self):
+        # Το όνομα διατηρείται για συμβατότητα — πλέον στέλνει μόνο το join.
+        # Όλη η επικοινωνία γίνεται μέσω WebSocket (TCP), όχι WebRTC.
         if not self.main_app.ws:
             print("No signaling connection")
             return
 
-        # 1) JOIN FIRST so server knows our username & room
         await self.main_app.ws.send(json.dumps({
             "type": "join",
             "room": self.room_name,
             "user": self.main_app.username
         }))
-
-        # 2) Create the PeerConnection immediately (with ICE config)
-        self.pc = RTCPeerConnection(ice_config)
-
-        # 3) ICE candidates handler
-        @self.pc.on("icecandidate")
-        async def on_icecandidate(event):
-            if event.candidate:
-                await self.main_app.ws.send(json.dumps({
-                    "type": "candidate",
-                    "room": self.room_name,
-                    "candidate": {
-                        "candidate": event.candidate.candidate,
-                        "sdpMid": event.candidate.sdpMid,
-                        "sdpMLineIndex": event.candidate.sdpMLineIndex,
-                    }
-                }))
-        # 4) If the OTHER side creates the DataChannel (joiner path)
-        @self.pc.on("datachannel")
-        def on_datachannel(channel):
-            self.on_datachannel(channel)
-
-        # 5) Do NOT send an offer here. The creator will send it later,
-        #    when a second user is present (user_list handler will trigger it).
-        if self.is_creator:
-            print(f"🟡 {self.main_app.username} (creator) joined and is waiting for a peer before sending OFFER.")
-        else:
-            print(f"🟡 {self.main_app.username} (joiner) waiting for OFFER")
+        print(f"🟢 {self.main_app.username} joined room '{self.room_name}' (TCP mode)")
 
     def poll_midi_input(self):
         if not self.midi_inputs:
@@ -1338,9 +1304,8 @@ class RoomWindow(QWidget):
         self.update_leader_ui(getattr(self.main_app, "room_leader", None))
 
     async def start_offer(self):
-        # Prevent duplicate offers
-        if self.offer_sent:
-            return
+        # WebRTC απενεργοποιημένο — όλα πάνε μέσω TCP.
+        return
 
         # Ensure PeerConnection exists
         if not self.pc:
@@ -2040,6 +2005,8 @@ class MidiUserApp(QMainWindow):
         return f"{base}_{idx}"
 
     async def handle_offer(self, data):
+        return
+
         print("📩 handle_offer called for", self.username)
 
         # ensure pc exists
@@ -2065,12 +2032,16 @@ class MidiUserApp(QMainWindow):
         print("📤 Sent ANSWER to server")
 
     async def handle_answer(self, data):
+        return
+
         print("📩 handle_answer called for", self.username)
         desc = RTCSessionDescription(sdp=data["sdp"], type=data.get("sdpType", "answer"))
         await self.room_window.pc.setRemoteDescription(desc)
         print("📡 Remote description set (answer)")
 
     async def handle_candidate(self, data):
+        return
+        
         print("📩 handle_candidate called for", self.username)
         from aiortc import RTCIceCandidate
         c = data.get("candidate")
