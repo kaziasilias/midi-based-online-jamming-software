@@ -74,6 +74,15 @@ async def websocket_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
+    # απενεργοποίηση Nagle algorithm (TCP_NODELAY) για χαμηλό latency
+    try:
+        import socket as _socket
+        sock = request.transport.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+    except Exception as e:
+        print("⚠️ Could not set TCP_NODELAY:", e)
+
     await ws.send_str(json.dumps({"type": "room_list", "rooms": list(rooms.keys())}))
     clients.add(ws)
 
@@ -223,6 +232,17 @@ async def websocket_handler(request):
 
                 continue
 
+            # ---------- TCP relay (MIDI notes + control messages) ----------
+            if data.get("tcp_midi") or data.get("tcp_relay"):
+                target_room = data.get("room", room)
+                if target_room and target_room in rooms:
+                    for peer in list(rooms.get(target_room, set())):
+                        if peer is not ws:
+                            try:
+                                await peer.send_str(msg.data)
+                            except Exception:
+                                pass
+                continue
             # ---------- WebRTC signaling relay ----------
             if mtype in ["offer", "answer", "candidate"]:
                 target_room = data.get("room")

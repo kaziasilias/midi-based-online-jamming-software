@@ -398,6 +398,17 @@ class RoomWindow(QWidget):
 
             print(f"✅ Opened MIDI input: {dev_name}")
 
+    def send_to_room(self, payload: dict):
+        """Στέλνει message σε όλους στο δωμάτιο μέσω WebSocket (TCP)."""
+        if not self.main_app.ws:
+            return
+        msg = {**payload, "room": self.room_name, "tcp_relay": True}
+        try:
+            asyncio.get_event_loop().create_task(
+                self.main_app.ws.send(json.dumps(msg))
+            )
+        except Exception as e:
+            print("⚠️ send_to_room failed:", e)
     def open_midi_input_with_retry(self, dev_name, retries=12, delay_ms=1000):
         from mido import open_input
 
@@ -429,12 +440,10 @@ class RoomWindow(QWidget):
 
 
     def send_streams_announce(self):
-        if not self.channel or getattr(self.channel, "readyState", None) != "open":
+        if not self.main_app.ws:
             return
-
         streams = []
 
-        # Prefer actually opened streams for this room session
         if getattr(self, "stream_devices", None):
             for stream_id, dev_name in self.stream_devices.items():
                 streams.append({"stream": stream_id, "device": dev_name})
@@ -444,18 +453,12 @@ class RoomWindow(QWidget):
                 stream_id = self.main_app.make_stream_id(dev_name, idx)
                 streams.append({"stream": stream_id, "device": dev_name})
 
-        payload = {
+        self.send_to_room({
             "type": "streams_announce",
-            "room": self.room_name,
             "user": self.main_app.username,
             "streams": streams
-        }
-
-        try:
-            self.channel.send(json.dumps(payload))
-            print("📣 Sent streams_announce:", payload)
-        except Exception as e:
-            print("⚠️ Failed to send streams_announce:", e)
+        })
+        print("📣 Sent streams_announce via TCP")
 
     def bump_velocity_bar(self, username: str, velocity: int):
         bar = self.user_velocity_bars.get(username)
@@ -627,7 +630,7 @@ class RoomWindow(QWidget):
             )
     async def send_ping(self):
         """Periodically send ping messages to every other connected user."""
-        if not self.channel or getattr(self.channel, "readyState", None) != "open":
+        if not self.main_app.ws:
             return
 
         now = time.time()
@@ -642,7 +645,7 @@ class RoomWindow(QWidget):
                 "t0": time.perf_counter(),
             }
             try:
-                self.channel.send(json.dumps(payload))
+                self.send_to_room(payload)
                 print(f"📤 Sent ping from {self.main_app.username} → {peer}")
             except Exception as e:
                 print("⚠️ Failed to send ping:", e)
@@ -872,7 +875,7 @@ class RoomWindow(QWidget):
                     if getattr(msg, "_from_network", False):
                         continue  # don't resend notes that came from network
 
-                    if self.channel and getattr(self.channel, "readyState", None) == "open":
+                    if self.main_app.ws:
                         self.midi_seq += 1
                         midi_event = {
                             "user": me,
@@ -883,11 +886,14 @@ class RoomWindow(QWidget):
                             "note": note,
                             "velocity": velocity,
                             "type": msg.type,
+                            "room": self.room_name,
+                            "tcp_midi": True,  # flag για τον server να το κάνει relay
                         }
-                        self.channel.send(json.dumps(midi_event))
-                        print("📤 Sent MIDI event:", midi_event)
+                        asyncio.get_event_loop().create_task(
+                            self.main_app.ws.send(json.dumps(midi_event))
+                        )
                     else:
-                        print("⏳ Channel not open, skipping send")
+                        print("⏳ WebSocket not connected, skipping send")
 
     def assign_leader(self, target_user: str):
         # only current leader can assign
@@ -1016,8 +1022,7 @@ class RoomWindow(QWidget):
                     "t1": time.perf_counter(),
                 }
 
-                if self.channel and getattr(self.channel, "readyState", None) == "open":
-                    self.channel.send(json.dumps(reply))
+                self.send_to_room(reply)
 
                 return
 
@@ -1093,8 +1098,26 @@ class RoomWindow(QWidget):
                 sender_ts = data.get("timestamp", time.perf_counter())
                 offset = self.clock_offset_from_peer.get(user, 0.0)
                 jitter_s = self.peer_jitter.get(user, 0.005)
-                adaptive_delay = max(0.005, 2.0 * jitter_s)
+                adaptive_delay = max(0.008, 2.0 * jitter_s)  # ελάχιστο 8ms buffer
                 play_time = sender_ts - offset + adaptive_delay
+                # μην αφήσεις play_time στο παρελθόν — αλλιώς χάνεται σε batch
+                play_time = max(play_time, time.perf_counter() + 0.002)
+
+                is_noteoff = (msg_type == "note_off" or
+                              (msg_type == "note_on" and effective_velocity == 0))
+
+                if not hasattr(self, "last_noteon_playtime"):
+                    self.last_noteon_playtime = {}
+
+                key_note = (user, stream, note)
+
+                if is_noteoff:
+                    # εγγύηση: note_off ΠΟΤΕ πριν το note_on του ίδιου note
+                    last_on = self.last_noteon_playtime.get(key_note, 0.0)
+                    if play_time <= last_on:
+                        play_time = last_on + 0.001  # 1ms μετά το note_on
+                else:
+                    self.last_noteon_playtime[key_note] = play_time
 
                 self.remote_midi_queue.append({
                     "play_time": play_time,
@@ -1159,23 +1182,29 @@ class RoomWindow(QWidget):
             except Exception as e:
                 print("⚠️ Scheduled MIDI playback error:", e)
     def send_midi(self, note, velocity):
-        if self.channel and self.channel.readyState == "open":
-            self.midi_seq += 1
-            midi_event = {
-                "user": self.main_app.username,
-                "stream": "gui",
-                "seq": self.midi_seq,
-                "timestamp": time.perf_counter(),
-                "note": note,
-                "velocity": velocity,
-                "type": "note_on" if velocity > 0 else "note_off",
-            }
-            self.channel.send(json.dumps(midi_event))
-
+        if not self.main_app.ws:
+            return
+        self.midi_seq += 1
+        midi_event = {
+            "user": self.main_app.username,
+            "stream": "gui",
+            "seq": self.midi_seq,
+            "timestamp": time.perf_counter(),
+            "note": note,
+            "velocity": velocity,
+            "type": "note_on" if velocity > 0 else "note_off",
+            "room": self.room_name,
+            "tcp_midi": True,
+        }
+        msg_type = "note_on" if velocity > 0 else "note_off"
+        self.ui.logArea.append(f"{self.main_app.username}/gui: {msg_type} note={note} vel={velocity}")
+        asyncio.get_event_loop().create_task(
+            self.main_app.ws.send(json.dumps(midi_event))
+        )
     def update_user_list(self, users):
         """Synchronize UI with the current list of connected users."""
         self.connected_users = users
-        if self.channel and getattr(self.channel, "readyState", None) == "open":
+        if self.main_app.ws:
             self.send_streams_announce()
 
         # 1️⃣ Add any new users not yet in the UI
@@ -1373,8 +1402,7 @@ class RoomWindow(QWidget):
 
         self.start_local_metronome(bpm, start_time)
 
-        if self.channel and getattr(self.channel, "readyState", None) == "open":
-            self.channel.send(json.dumps(payload))
+        self.send_to_room(payload)
 
         print("▶️ Metronome start sent:", payload)
 
@@ -1390,8 +1418,7 @@ class RoomWindow(QWidget):
             "leader": self.main_app.username
         }
 
-        if self.channel and getattr(self.channel, "readyState", None) == "open":
-            self.channel.send(json.dumps(payload))
+        self.send_to_room(payload)
 
         print("⏹️ Metronome stop sent")
 
@@ -1409,8 +1436,7 @@ class RoomWindow(QWidget):
             "leader": self.main_app.username
         }
 
-        if self.channel and getattr(self.channel, "readyState", None) == "open":
-            self.channel.send(json.dumps(payload))
+        self.send_to_room(payload)
 
         print("🎚️ BPM update sent:", bpm)
 
@@ -2070,7 +2096,11 @@ class MidiUserApp(QMainWindow):
                     async for message in ws:
                         data = json.loads(message)
                         print("📨 Received message from server:", data.get("type"))
-                        if data["type"] == "room_list":
+                        if data.get("tcp_midi") or data.get("tcp_relay"):
+                            if self.room_window:
+                                self.room_window.on_midi_message(json.dumps(data))
+                            continue
+                        if data.get("type") == "room_list":
                             rooms = data.get("rooms", [])
                             QtCore.QMetaObject.invokeMethod(
                                 self,
@@ -2078,7 +2108,7 @@ class MidiUserApp(QMainWindow):
                                 QtCore.Qt.QueuedConnection,
                                 QtCore.Q_ARG(list, rooms)
                             )
-                        elif data["type"] == "user_list":
+                        elif data.get("type") == "user_list":
                             users = data.get("users", [])
                             if self.room_window:
                                 # Update current connected users
