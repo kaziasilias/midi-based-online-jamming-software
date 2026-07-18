@@ -231,7 +231,20 @@ async def websocket_handler(request):
                     await broadcast_room_list()
 
                 continue
-
+            # ---------- CLOCK SYNC (server = master clock) ----------
+            if mtype == "clock_sync":
+                # ο client στέλνει t0, ο server απαντά με το δικό του χρόνο
+                import time as _time
+                server_recv = _time.perf_counter()
+                try:
+                    await ws.send_str(json.dumps({
+                        "type": "clock_sync_reply",
+                        "t0": data.get("t0"),  # ο αρχικός χρόνος του client
+                        "server_time": server_recv,  # ο χρόνος του server
+                    }))
+                except Exception:
+                    pass
+                continue
             # ---------- TCP relay (MIDI notes + control messages) ----------
             if data.get("tcp_midi") or data.get("tcp_relay"):
                 target_room = data.get("room", room)

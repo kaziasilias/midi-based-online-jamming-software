@@ -321,6 +321,8 @@ class RoomWindow(QWidget):
         self.remote_playback_timer = QtCore.QTimer()
         self.remote_playback_timer.timeout.connect(self.process_remote_midi_queue)
         self.remote_playback_timer.start(2)
+        self.server_clock_offset = 0.0  # διαφορά τοπικού ρολογιού από τον server
+        self.server_rtt_samples = []  # για jitter measurement
 
         from mido import open_input, open_output
 
@@ -619,28 +621,51 @@ class RoomWindow(QWidget):
             QtCore.QTimer.singleShot(
                 3000, lambda: self.try_reopen_device(dev_name, attempt + 1)
             )
+
     async def send_ping(self):
-        """Periodically send ping messages to every other connected user."""
+        """Συγχρονισμός με το ρολόι του server (server = master clock)."""
         if not self.main_app.ws:
             return
-
-        now = time.time()
-        # make sure connected_users exists
-        for peer in getattr(self, "connected_users", []):
-            if peer == self.main_app.username:
-                continue  # skip self
-            payload = {
-                "type": "sync_ping",
-                "from": self.main_app.username,
-                "to": peer,
+        try:
+            # στέλνει απευθείας στον server (όχι relay), με τον τοπικό χρόνο t0
+            await self.main_app.ws.send(json.dumps({
+                "type": "clock_sync",
                 "t0": time.perf_counter(),
-            }
-            try:
-                self.send_to_room(payload)
-                print(f"📤 Sent ping from {self.main_app.username} → {peer}")
-            except Exception as e:
-                print("⚠️ Failed to send ping:", e)
+            }))
+        except Exception as e:
+            print("⚠️ Failed to send clock_sync:", e)
 
+    def handle_clock_sync(self, data):
+        """Υπολογίζει το offset από το ρολόι του server (NTP-style)."""
+        t2 = time.perf_counter()
+        t0 = data.get("t0")
+        server_time = data.get("server_time")
+        if t0 is None or server_time is None:
+            return
+
+        rtt = t2 - t0
+        # εκτίμηση: όταν ο server κατέγραψε server_time, ο τοπικός μας χρόνος ήταν t0 + rtt/2
+        estimated_local_at_server = t0 + rtt / 2.0
+        offset = server_time - estimated_local_at_server
+
+        self.server_clock_offset = offset
+
+        # jitter tracking
+        rtt_ms = rtt * 1000
+        self.server_rtt_samples.append(rtt_ms)
+        self.server_rtt_samples = self.server_rtt_samples[-20:]
+        if len(self.server_rtt_samples) > 2:
+            jitter_ms = statistics.stdev(self.server_rtt_samples)
+            self.peer_jitter["_server"] = jitter_ms / 1000.0
+        else:
+            jitter_ms = 0.0
+
+        oneway_ms = rtt_ms / 2.0
+        # ενημέρωσε το UI (δείχνει latency προς server)
+        if hasattr(self, "ui"):
+            self.ui.logArea.append(
+                f"🕒 Server sync: latency={oneway_ms:.1f}ms jitter={jitter_ms:.1f}ms offset={offset * 1000:.1f}ms"
+            )
     def handle_pong(self, data):
         return
 
@@ -847,7 +872,7 @@ class RoomWindow(QWidget):
                             "user": me,
                             "stream": stream_id,
                             "seq": self.midi_seq,
-                            "timestamp": time.perf_counter(),
+                            "timestamp": time.perf_counter() + self.server_clock_offset,
                             "input_ts": input_ts,
                             "note": note,
                             "velocity": velocity,
@@ -1061,12 +1086,13 @@ class RoomWindow(QWidget):
                 if velocity is not None:
                     self.bump_velocity_bar(user, velocity)
 
-                sender_ts = data.get("timestamp", time.perf_counter())
-                offset = self.clock_offset_from_peer.get(user, 0.0)
-                jitter_s = self.peer_jitter.get(user, 0.005)
-                adaptive_delay = max(0.008, 2.0 * jitter_s)  # ελάχιστο 8ms buffer
-                play_time = sender_ts - offset + adaptive_delay
-                # μην αφήσεις play_time στο παρελθόν — αλλιώς χάνεται σε batch
+                # το sender_ts είναι σε SERVER TIME — μετάτρεψέ το σε τοπικό
+                sender_ts_server = data.get("timestamp", time.perf_counter())
+                sender_ts_local = sender_ts_server - self.server_clock_offset
+
+                jitter_s = self.peer_jitter.get("_server", 0.005)
+                adaptive_delay = max(0.008, 2.0 * jitter_s)
+                play_time = sender_ts_local + adaptive_delay
                 play_time = max(play_time, time.perf_counter() + 0.002)
 
                 is_noteoff = (msg_type == "note_off" or
@@ -1155,7 +1181,7 @@ class RoomWindow(QWidget):
             "user": self.main_app.username,
             "stream": "gui",
             "seq": self.midi_seq,
-            "timestamp": time.perf_counter(),
+            "timestamp": time.perf_counter() + self.server_clock_offset,
             "note": note,
             "velocity": velocity,
             "type": "note_on" if velocity > 0 else "note_off",
@@ -2041,7 +2067,7 @@ class MidiUserApp(QMainWindow):
 
     async def handle_candidate(self, data):
         return
-        
+
         print("📩 handle_candidate called for", self.username)
         from aiortc import RTCIceCandidate
         c = data.get("candidate")
@@ -2067,6 +2093,10 @@ class MidiUserApp(QMainWindow):
                     async for message in ws:
                         data = json.loads(message)
                         print("📨 Received message from server:", data.get("type"))
+                        if data.get("type") == "clock_sync_reply":
+                            if self.room_window:
+                                self.room_window.handle_clock_sync(data)
+                            continue
                         if data.get("tcp_midi") or data.get("tcp_relay"):
                             if self.room_window:
                                 self.room_window.on_midi_message(json.dumps(data))
