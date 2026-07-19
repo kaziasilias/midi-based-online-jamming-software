@@ -27,6 +27,98 @@ SIGNALING_SERVER = "ws://155.207.200.166:8080/ws"  # change to your VPS
 
 import subprocess, threading, queue
 
+import csv as _csv_module
+from datetime import datetime as _dt
+
+class LogManager:
+    """
+    Κεντρικό σύστημα logging με κατηγορίες και 3 προορισμούς:
+    cmd (console), room (UI log), file (CSV για ανάλυση).
+    Κάθε κατηγορία μπορεί να ενεργοποιηθεί/απενεργοποιηθεί ανά προορισμό.
+    """
+    # Στατικές κατηγορίες
+    CATEGORIES = ["MY_MIDI", "CLOCK", "DEVICE", "ROOM", "SYSTEM", "ERROR"]
+
+    def __init__(self, room_window):
+        self.room_window = room_window
+
+        # routing[category][destination] = True/False
+        # destinations: "cmd", "room", "file"
+        self.routing = {}
+        for cat in self.CATEGORIES:
+            self.routing[cat] = {"cmd": True, "room": True, "file": False}
+
+        # δυναμικές κατηγορίες ανά peer: "PEER:<username>"
+        self.peer_routing = {}  # username -> {"cmd":bool,"room":bool,"file":bool}
+
+        # CSV file
+        self.csv_file = None
+        self.csv_writer = None
+        self.file_enabled = False
+
+    # ---- διαχείριση peer κατηγοριών ----
+    def ensure_peer(self, username):
+        if username not in self.peer_routing:
+            self.peer_routing[username] = {"cmd": True, "room": True, "file": False}
+
+    def remove_peer(self, username):
+        self.peer_routing.pop(username, None)
+
+    # ---- CSV file control ----
+    def start_file(self, filepath):
+        try:
+            self.csv_file = open(filepath, "w", newline="", encoding="utf-8")
+            self.csv_writer = _csv_module.writer(self.csv_file)
+            self.csv_writer.writerow(["timestamp", "category", "message"])
+            self.file_enabled = True
+            self.log("SYSTEM", f"📝 Logging to file: {filepath}")
+        except Exception as e:
+            print(f"⚠️ Could not open log file: {e}")
+            self.file_enabled = False
+
+    def stop_file(self):
+        self.file_enabled = False
+        try:
+            if self.csv_file:
+                self.csv_file.close()
+        except Exception:
+            pass
+        self.csv_file = None
+        self.csv_writer = None
+
+    # ---- κύρια μέθοδος logging ----
+    def log(self, category, message, peer=None):
+        """
+        category: μία από τις CATEGORIES, ή None αν είναι peer message
+        peer: username αν το μήνυμα αφορά συγκεκριμένο peer (PEER_MIDI)
+        """
+        if peer is not None:
+            self.ensure_peer(peer)
+            route = self.peer_routing.get(peer, {"cmd": True, "room": True, "file": False})
+            cat_label = f"PEER:{peer}"
+        else:
+            route = self.routing.get(category, {"cmd": True, "room": True, "file": False})
+            cat_label = category
+
+        # 1) console
+        if route.get("cmd", False):
+            print(f"[{cat_label}] {message}")
+
+        # 2) room log (UI)
+        if route.get("room", False):
+            try:
+                self.room_window.ui.logArea.append(message)
+            except Exception:
+                pass
+
+        # 3) file (CSV)
+        if route.get("file", False) and self.file_enabled and self.csv_writer:
+            try:
+                ts = _dt.now().strftime("%H:%M:%S.%f")[:-3]
+                self.csv_writer.writerow([ts, cat_label, message])
+                self.csv_file.flush()
+            except Exception:
+                pass
 def force_winmm_refresh():
     """
     Αναγκάζει το Windows WinMM να ξανακαταγράψει τις MIDI συσκευές.
@@ -294,6 +386,7 @@ class RoomWindow(QWidget):
         self.setWindowTitle(f"MIDIROOMS - {room_name}")
         self.ui.LeaveButton.clicked.connect(self.leave_room)
         self.ui.logArea.clear()
+        self.log_manager = LogManager(self)
         self.user_ui_elements = {}
         self.user_velocity_bars = {}
         self.user_latency_labels = {}
@@ -305,6 +398,10 @@ class RoomWindow(QWidget):
         self.add_user_ui(self.main_app.username)  # show myself
         self.ui.muteButton.clicked.connect(self.toggle_local_mute)
         self.ui.routingmanagerButton.clicked.connect(self.open_routing_manager)
+        # κουμπί για Log Settings
+        self.logSettingsButton = QtWidgets.QPushButton("Log Settings", self)
+        self.ui.horizontalLayout.addWidget(self.logSettingsButton)
+        self.logSettingsButton.clicked.connect(self.open_log_settings)
         # WebRTC objects
         self.offer_sent = False
         self.pc = None
@@ -401,7 +498,7 @@ class RoomWindow(QWidget):
                 self.main_app.ws.send(json.dumps(msg))
             )
         except Exception as e:
-            print("⚠️ send_to_room failed:", e)
+            self.log_manager.log("ERROR", f"⚠️ send_to_room failed: {e}")
     def open_midi_input_with_retry(self, dev_name, retries=12, delay_ms=1000):
         from mido import open_input
 
@@ -451,7 +548,7 @@ class RoomWindow(QWidget):
             "user": self.main_app.username,
             "streams": streams
         })
-        print("📣 Sent streams_announce via TCP")
+        self.log_manager.log("SYSTEM", "📣 Sent streams_announce via TCP")
 
     def bump_velocity_bar(self, username: str, velocity: int):
         bar = self.user_velocity_bars.get(username)
@@ -537,9 +634,7 @@ class RoomWindow(QWidget):
                 print(f"➕ Hotplug: opened {stream_id} = {dev_name}")
 
                 # ειδοποίηση επανασύνδεσης στο UI log
-                self.ui.logArea.append(
-                    f"✅ MIDI device reconnected: {dev_name} — ready to use"
-                )
+                self.log_manager.log("DEVICE", f"✅ MIDI device reconnected: {dev_name} — ready to use")
                 # ενημέρωσε τον πίνακα αν είναι ανοιχτός
                 if getattr(self.main_app, "routing_manager_dialog", None):
                     self.main_app.routing_manager_dialog.refresh_table()
@@ -571,7 +666,7 @@ class RoomWindow(QWidget):
             return
 
         if attempt > MAX_ATTEMPTS:
-            self.ui.logArea.append(f"❌ Could not reconnect {dev_name} after {MAX_ATTEMPTS} attempts.")
+            self.log_manager.log("DEVICE", f"❌ Could not reconnect {dev_name} after {MAX_ATTEMPTS} attempts.")
             print(f"❌ Giving up on {dev_name}")
             return
 
@@ -607,7 +702,7 @@ class RoomWindow(QWidget):
             self.stream_devices[stream_id] = dev_name
             self.failed_inputs.discard(dev_name.lower())
 
-            self.ui.logArea.append(f"✅ MIDI device reconnected: {dev_name} — ready to use")
+            self.log_manager.log("DEVICE", f"✅ MIDI device reconnected: {dev_name} — ready to use")
             print(f"✅ Reopened {dev_name} as {stream_id}")
 
             if getattr(self.main_app, "routing_manager_dialog", None):
@@ -663,9 +758,9 @@ class RoomWindow(QWidget):
         oneway_ms = rtt_ms / 2.0
         # ενημέρωσε το UI (δείχνει latency προς server)
         if hasattr(self, "ui"):
-            self.ui.logArea.append(
-                f"🕒 Server sync: latency={oneway_ms:.1f}ms jitter={jitter_ms:.1f}ms offset={offset * 1000:.1f}ms"
-            )
+            self.log_manager.log("CLOCK",
+                                 f"🕒 Server sync: latency={oneway_ms:.1f}ms jitter={jitter_ms:.1f}ms offset={offset * 1000:.1f}ms"
+                                 )
     def handle_pong(self, data):
         return
 
@@ -826,9 +921,7 @@ class RoomWindow(QWidget):
                 if lost_dev:
                     self.failed_inputs.discard(lost_dev.lower())
                     print(f"🔌 Συσκευή αποσυνδέθηκε: {lost_dev} — αναμένουμε επανασύνδεση")
-                    self.ui.logArea.append(
-                        f"⚠️ MIDI device disconnected: {lost_dev} — waiting for reconnect..."
-                    )
+                    self.log_manager.log("DEVICE",f"⚠️ MIDI device disconnected: {lost_dev} — waiting for reconnect...")
                     if getattr(self.main_app, "routing_manager_dialog", None):
                         self.main_app.routing_manager_dialog.refresh_table()
                     # ξεκίνα αυτόματη ασύγχρονη επαναφορά
@@ -854,7 +947,7 @@ class RoomWindow(QWidget):
                         channel=getattr(msg, "channel", 0)
                     )
                     # --- Local visualization ---
-                    self.ui.logArea.append(f"{me}/{stream_id}: {msg.type} note={note} vel={velocity}")
+                    self.log_manager.log("MY_MIDI", f"{me}/{stream_id}: {msg.type} note={note} vel={velocity}")
                     if hasattr(self, "piano"):
                         self.piano._highlight(note, velocity > 0)
                     if not self.local_mute:
@@ -918,6 +1011,11 @@ class RoomWindow(QWidget):
         self.ui.applyBpmButton.setEnabled(leader_controls_enabled)
         self.ui.startMetronomeButton.setEnabled(leader_controls_enabled)
         self.ui.stopMetronomeButton.setEnabled(leader_controls_enabled)
+
+    def open_log_settings(self):
+        dlg = LogSettingsDialog(self)
+        dlg.exec_()
+
     def on_midi_message(self, message):
         port_name = None
         try:
@@ -1122,7 +1220,7 @@ class RoomWindow(QWidget):
 
                 self.remote_midi_queue.sort(key=lambda e: e["play_time"])
             # --- GUI Piano highlight ---
-            self.ui.logArea.append(f"{user}/{stream}: {msg_type} note={note} vel={velocity}")
+            self.log_manager.log(None, f"{user}/{stream}: {msg_type} note={note} vel={velocity}", peer=user)
             if hasattr(self, "piano"):
                 if velocity is not None and velocity > 0:
                     self.piano._highlight(note, True)
@@ -1189,7 +1287,7 @@ class RoomWindow(QWidget):
             "tcp_midi": True,
         }
         msg_type = "note_on" if velocity > 0 else "note_off"
-        self.ui.logArea.append(f"{self.main_app.username}/gui: {msg_type} note={note} vel={velocity}")
+        self.log_manager.log("MY_MIDI", f"{self.main_app.username}/gui: {msg_type} note={note} vel={velocity}")
         asyncio.get_event_loop().create_task(
             self.main_app.ws.send(json.dumps(midi_event))
         )
@@ -1251,7 +1349,7 @@ class RoomWindow(QWidget):
             self.channel = None
             self.offer_sent = False
 
-        print(f"👥 Updated user list: {users}")
+        self.log_manager.log("ROOM", f"👥 Updated user list: {users}")
 
     def kick_user(self, target_user: str):
         # only leader can kick
@@ -1281,7 +1379,9 @@ class RoomWindow(QWidget):
     def add_user_ui(self, username):
         if username in self.user_ui_elements:
             return
-
+        if hasattr(self, "log_manager") and username != self.main_app.username:
+            self.log_manager.ensure_peer(username)
+            self.log_manager.log("ROOM", f"➕ User joined: {username}")
         container = QtWidgets.QWidget()
         outer = QtWidgets.QVBoxLayout(container)
 
@@ -1848,6 +1948,87 @@ class RoutingManager(QDialog):
         # ανανέωσε τον πίνακα
         QtCore.QTimer.singleShot(200, self.refresh_table)
 
+class LogSettingsDialog(QtWidgets.QDialog):
+    """Παράθυρο με τικ για έλεγχο του τι εμφανίζεται πού."""
+    def __init__(self, room_window):
+        super().__init__()
+        self.room_window = room_window
+        self.lm = room_window.log_manager
+        self.setWindowTitle("Log Settings")
+        self.resize(600, 500)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Πίνακας: γραμμές = κατηγορίες, στήλες = cmd/room/file
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Category", "CMD", "Room Log", "Save to File"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.table)
+
+        # File controls
+        file_row = QtWidgets.QHBoxLayout()
+        self.file_btn = QtWidgets.QPushButton("Start Saving to CSV...")
+        self.file_btn.clicked.connect(self.toggle_file)
+        file_row.addWidget(self.file_btn)
+        self.file_label = QtWidgets.QLabel("(no file)")
+        file_row.addWidget(self.file_label)
+        layout.addLayout(file_row)
+
+        close_btn = QtWidgets.QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
+
+        self.refresh_table()
+
+    def refresh_table(self):
+        self.table.setRowCount(0)
+
+        # στατικές κατηγορίες
+        rows = [(cat, None) for cat in self.lm.CATEGORIES]
+        # δυναμικές peer κατηγορίες
+        for peer in self.lm.peer_routing.keys():
+            rows.append((f"PEER: {peer}", peer))
+
+        for label, peer in rows:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            item = QtWidgets.QTableWidgetItem(label)
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(row, 0, item)
+
+            route = (self.lm.peer_routing[peer] if peer
+                     else self.lm.routing[label])
+
+            for col, dest in enumerate(["cmd", "room", "file"], start=1):
+                chk = QtWidgets.QCheckBox()
+                chk.setChecked(route.get(dest, False))
+                chk.stateChanged.connect(
+                    lambda state, r=route, d=dest: r.update({d: state == QtCore.Qt.Checked})
+                )
+                cell = QtWidgets.QWidget()
+                l = QtWidgets.QHBoxLayout(cell)
+                l.addWidget(chk)
+                l.setAlignment(QtCore.Qt.AlignCenter)
+                l.setContentsMargins(0, 0, 0, 0)
+                self.table.setCellWidget(row, col, cell)
+
+    def toggle_file(self):
+        if self.lm.file_enabled:
+            self.lm.stop_file()
+            self.file_btn.setText("Start Saving to CSV...")
+            self.file_label.setText("(no file)")
+        else:
+            fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save log as CSV",
+                f"midirooms_log_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "CSV Files (*.csv)"
+            )
+            if fname:
+                self.lm.start_file(fname)
+                self.file_btn.setText("Stop Saving")
+                self.file_label.setText(fname.split("/")[-1])
 
 class RoomSettingsWindow(QMainWindow):
     def __init__(self, parent=None):
@@ -2092,7 +2273,6 @@ class MidiUserApp(QMainWindow):
 
                     async for message in ws:
                         data = json.loads(message)
-                        print("📨 Received message from server:", data.get("type"))
                         if data.get("type") == "clock_sync_reply":
                             if self.room_window:
                                 self.room_window.handle_clock_sync(data)
