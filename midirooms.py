@@ -1189,7 +1189,7 @@ class RoomWindow(QWidget):
                 sender_ts_local = sender_ts_server - self.server_clock_offset
 
                 jitter_s = self.peer_jitter.get("_server", 0.005)
-                adaptive_delay = max(0.008, 2.0 * jitter_s)
+                adaptive_delay = max(0.015, 2.5 * jitter_s)
                 play_time = sender_ts_local + adaptive_delay
                 play_time = max(play_time, time.perf_counter() + 0.002)
 
@@ -1482,7 +1482,8 @@ class RoomWindow(QWidget):
             return
 
         bpm = self.ui.bpmSpinBox.value()
-        start_time = time.time() + 3.0
+        # start_time σε SERVER TIME reference (ίδιο με τα MIDI notes)
+        start_time = time.perf_counter() + self.server_clock_offset + 3.0
 
         payload = {
             "type": "metronome_start",
@@ -1546,7 +1547,8 @@ class RoomWindow(QWidget):
         if not self.metronome_running or self.metronome_start_time is None:
             return
 
-        now = time.time()
+        # now σε SERVER TIME reference — ίδιο με το start_time
+        now = time.perf_counter() + self.server_clock_offset
 
         if now < self.metronome_start_time:
             return
@@ -1644,58 +1646,6 @@ class RoomWindow(QWidget):
             f"Recording saved locally as:\n{filename}"
         )
 
-    def process_remote_midi_queue(self):
-        if not self.remote_midi_queue:
-            return
-
-        now = time.perf_counter()
-
-        ready = []
-        while self.remote_midi_queue and self.remote_midi_queue[0]["play_time"] <= now:
-            event = self.remote_midi_queue.pop(0)
-
-            lateness_ms = (now - event["play_time"]) * 1000
-            if lateness_ms > 35:
-                print(f"⏭️ Dropped late MIDI note: {lateness_ms:.1f} ms")
-                continue
-
-            ready.append(event)
-
-        for event in ready:
-            user = event["user"]
-            stream = event["stream"]
-            msg_type = event["type"]
-            note = event["note"]
-            velocity = event["velocity"]
-
-            try:
-                msg = Message(msg_type, note=note, velocity=velocity)
-
-                route = self.main_app.routing_config.get((user, stream))
-                vmidi_name = None
-                channel = 1
-
-                if route:
-                    vmidi_name = route.get("vmidi")
-                    channel = route.get("channel", 1)
-
-                msg.channel = (int(channel) - 1) if channel else 0
-
-                if vmidi_name and getattr(self.main_app, "vmidi", None):
-                    b = msg.bytes()
-                    hex_bytes = " ".join(f"{x:02X}" for x in b)
-                    ok = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
-                    vmidi_start = time.perf_counter()
-                    vmidi_ms = (time.perf_counter() - vmidi_start) * 1000
-                    print(f"VMIDI SEND = {vmidi_ms:.2f} ms")
-
-                    if ok:
-                        print(f"🎧 Scheduled {user}/{stream} → {vmidi_name} ch {channel}")
-                    else:
-                        print(f"❌ Scheduled route failed {user}/{stream} → {vmidi_name}")
-
-            except Exception as e:
-                print("⚠️ Scheduled MIDI playback error:", e)
     def record_midi_event(self, user, stream, msg_type, note, velocity, channel=0):
         if not getattr(self, "recording", False):
             return
